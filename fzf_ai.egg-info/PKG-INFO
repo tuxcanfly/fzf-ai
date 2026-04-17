@@ -98,6 +98,9 @@ pip install fzf_ai-1.0.0.tar.gz
 pip install fzf-ai
 ```
 
+The pip installation will automatically add the scripts to your PATH if you have
+the Python bin directory in your PATH (typically `~/.local/bin` or `~/Library/Python/3.x/bin`).
+
 ### Option 2: Using Make (traditional method)
 ```bash
 # Clone or download the repository
@@ -105,6 +108,17 @@ cd fzf-ai
 make install-symlink
 # Make sure ~/.local/bin is in your PATH
 export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Option 3: Manual installation
+```bash
+# Add the bin directory to your PATH
+export PATH="$PWD/bin:$PATH"
+# Or create symlinks to a directory in your PATH
+ln -s "$PWD/bin/fzf-ai"          ~/.local/bin/fzf-ai
+ln -s "$PWD/bin/fzf-ai-index"    ~/.local/bin/fzf-ai-index
+ln -s "$PWD/bin/fzf-ai-preview"  ~/.local/bin/fzf-ai-preview
+ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 ```
 
 ### Option 3: Manual installation

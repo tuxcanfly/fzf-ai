@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""fzf-ai-index: walk every AI CLI's session store and emit one TAB-separated
+record per session on stdout.
+
+Output columns (TAB separated, 1-indexed to match fzf's {n}):
+    1  agent-raw    machine tag (claude, codex, opencode, droid, pi)
+    2  session_id   native session id used to resume
+    3  source       absolute path or 'sqlite:<db>' locator
+    4  agent-badge  padded + ANSI-colored agent tag (visible)
+    5  updated_iso  ISO-8601 UTC timestamp of last activity
+    6  msgs         message count (approx, best-effort)
+    7  cwd          working directory / project root
+    8  title        first real user prompt or stored title, truncated
+    9  search_blob  concatenated user-prompt text for fuzzy matching
+                    (hidden from view, searched via --nth)
+
+Records are sorted with the most recently updated first so fzf shows them
+at the top.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+HOME = Path(os.path.expanduser("~"))
+
+MAX_TITLE = 120
+MAX_SEARCH_BLOB = 4000   # per session, enough for fuzzy search
+MAX_SEARCH_PROMPT = 400  # per prompt
+
+# Colors for the agent tag in the main list (fzf with --ansi renders these).
+_AGENT_COLOR = {
+    "claude":   "38;5;208",  # orange
+    "codex":    "38;5;39",   # cyan
+    "opencode": "38;5;141",  # purple
+    "droid":    "38;5;76",   # green
+    "pi":       "38;5;220",  # yellow
+}
+
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+
+def colorise(agent: str) -> str:
+    if NO_COLOR:
+        return f"{agent:<8}"
+    code = _AGENT_COLOR.get(agent, "1")
+    return f"\033[{code}m{agent:<8}\033[0m"
+
+
+@dataclass
+class Record:
+    agent: str
+    session_id: str
+    source: str
+    updated: float = 0.0  # unix seconds
+    msgs: int = 0
+    cwd: str = ""
+    title: str = ""
+    # user prompts joined with " · " for fuzzy search (hidden column)
+    prompts: list = field(default_factory=list)
+
+    def add_prompt(self, text: str) -> None:
+        if not is_real_prompt(text):
+            return
+        t = clean(text)[:MAX_SEARCH_PROMPT]
+        if t and t not in self.prompts:
+            self.prompts.append(t)
+
+    def as_row(self) -> str:
+        iso = (
+            datetime.fromtimestamp(self.updated, tz=timezone.utc)
+            .strftime("%Y-%m-%d %H:%M")
+            if self.updated
+            else ""
+        )
+        title = clean(self.title)[:MAX_TITLE] or "(no title)"
+        cwd = self.cwd or ""
+        # short cwd: replace $HOME with ~ for display compactness
+        if cwd.startswith(str(HOME)):
+            cwd = "~" + cwd[len(str(HOME)) :]
+        # Build search blob: strip TABs/newlines, cap total size.
+        blob = " · ".join(self.prompts)
+        blob = blob.replace("\t", " ").replace("\n", " ")[:MAX_SEARCH_BLOB]
+        # Layout: columns 1..3 are machine-only (hidden from view); columns
+        # 4..8 are visible. Column 9 is a hidden search-only blob.
+        return "\t".join(
+            [
+                self.agent,                     # 1  raw agent   (hidden)
+                self.session_id,                # 2  session id  (hidden)
+                self.source,                    # 3  source      (hidden)
+                colorise(self.agent),           # 4  agent badge (visible)
+                f"{iso:<16}",                   # 5  date
+                f"{self.msgs:>4}",              # 6  msgs
+                f"{cwd:<40}",                   # 7  cwd
+                title,                          # 8  title
+                blob,                           # 9  search blob (hidden)
+            ]
+        )
+
+
+def clean(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+_JUNK_PREFIXES = (
+    "<",  # xml-ish tags, <command-name>, <system-reminder>, <env...>
+    "Caveat:",
+    "[Request interrupted",
+)
+
+
+def is_real_prompt(text: str) -> bool:
+    """Return True only for what looks like an organic user prompt."""
+    if not text:
+        return False
+    t = text.lstrip()
+    if not t:
+        return False
+    for p in _JUNK_PREFIXES:
+        if t.startswith(p):
+            return False
+    return True
+
+
+def iso_to_epoch(s: str) -> float:
+    if not s:
+        return 0.0
+    try:
+        # handle trailing Z
+        s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return 0.0
+
+
+# --------------------------------------------------------------------------
+# Claude Code  -- ~/.claude/projects/<enc-cwd>/<uuid>.jsonl
+# --------------------------------------------------------------------------
+def walk_claude() -> Iterator[Record]:
+    root = HOME / ".claude" / "projects"
+    if not root.is_dir():
+        return
+    for proj in root.iterdir():
+        if not proj.is_dir():
+            continue
+        for jf in proj.glob("*.jsonl"):
+            try:
+                rec = _read_claude_file(jf)
+                if rec:
+                    yield rec
+            except Exception as e:
+                print(f"claude: {jf}: {e}", file=sys.stderr)
+
+
+def _read_claude_file(path: Path) -> Optional[Record]:
+    sid = path.stem
+    rec = Record(
+        agent="claude",
+        session_id=sid,
+        source=str(path),
+        updated=path.stat().st_mtime,
+    )
+    title = ""
+    cwd = ""
+    msgs = 0
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") in ("user", "assistant"):
+                msgs += 1
+            if not cwd and obj.get("cwd"):
+                cwd = obj["cwd"]
+            if obj.get("type") == "user" and not obj.get("isMeta"):
+                m = obj.get("message") or {}
+                content = m.get("content")
+                if isinstance(content, str):
+                    if is_real_prompt(content):
+                        if not title:
+                            title = content
+                        rec.add_prompt(content)
+                elif isinstance(content, list):
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            tx = p.get("text", "")
+                            if is_real_prompt(tx):
+                                if not title:
+                                    title = tx
+                                rec.add_prompt(tx)
+            ts = obj.get("timestamp")
+            if ts:
+                e = iso_to_epoch(ts)
+                if e > rec.updated:
+                    rec.updated = e
+    rec.title = title
+    rec.cwd = cwd
+    rec.msgs = msgs
+    return rec
+
+
+# --------------------------------------------------------------------------
+# Codex  -- ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+# --------------------------------------------------------------------------
+def walk_codex() -> Iterator[Record]:
+    root = HOME / ".codex" / "sessions"
+    if not root.is_dir():
+        return
+    for jf in root.rglob("rollout-*.jsonl"):
+        try:
+            rec = _read_codex_file(jf)
+            if rec:
+                yield rec
+        except Exception as e:
+            print(f"codex: {jf}: {e}", file=sys.stderr)
+
+
+def _read_codex_file(path: Path) -> Optional[Record]:
+    # filename: rollout-2025-09-25T21-35-23-<uuid>.jsonl
+    m = re.match(
+        r"rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f-]+)\.jsonl$",
+        path.name,
+    )
+    sid = m.group(1) if m else path.stem
+    rec = Record(
+        agent="codex",
+        session_id=sid,
+        source=str(path),
+        updated=path.stat().st_mtime,
+    )
+    title = ""
+    cwd = ""
+    msgs = 0
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            payload = obj.get("payload") or {}
+            if t == "session_meta":
+                if payload.get("cwd"):
+                    cwd = payload["cwd"]
+                if payload.get("id"):
+                    rec.session_id = payload["id"]
+            if t == "response_item" and payload.get("type") == "message":
+                role = payload.get("role")
+                if role in ("user", "assistant"):
+                    msgs += 1
+                if role == "user":
+                    for c in payload.get("content", []) or []:
+                        if isinstance(c, dict) and c.get("type") in (
+                            "input_text",
+                            "text",
+                        ):
+                            tx = c.get("text", "")
+                            if is_real_prompt(tx):
+                                if not title:
+                                    title = tx
+                                rec.add_prompt(tx)
+            ts = obj.get("timestamp")
+            if ts:
+                e = iso_to_epoch(ts)
+                if e > rec.updated:
+                    rec.updated = e
+    rec.title = title
+    rec.cwd = cwd
+    rec.msgs = msgs
+    return rec
+
+
+# --------------------------------------------------------------------------
+# opencode -- sqlite at ~/.opencode/opencode.db
+# --------------------------------------------------------------------------
+# opencode has two schema generations in the wild plus per-project databases:
+#   * current:  ~/.local/share/opencode/opencode.db
+#               tables: session(id, directory, title, time_updated, ...),
+#                       message(id, session_id, time_created, data JSON),
+#                       part(message_id, session_id, data JSON, ...)
+#   * legacy:   ~/.opencode/opencode.db
+#               tables: sessions, messages, files  (flat)
+#   * per-project: <repo>/.opencode/opencode.db  (same legacy layout)
+# --------------------------------------------------------------------------
+def _opencode_db_paths(max_depth: int = 4) -> list[Path]:
+    """Return every opencode db on disk, newest first.
+
+    We find per-project ``<repo>/.opencode/opencode.db`` files by a
+    bounded-depth os.walk (rather than ``rglob('**')``) because the latter
+    takes 5-10 s on a large work tree.
+    """
+    seen: dict[Path, float] = {}
+    candidates = [
+        HOME / ".local" / "share" / "opencode" / "opencode.db",
+        HOME / ".opencode" / "opencode.db",
+    ]
+    for c in candidates:
+        if c.is_file():
+            seen[c.resolve()] = c.stat().st_mtime
+
+    skip_dirs = {
+        ".git", "node_modules", ".venv", "venv", "__pycache__", "target",
+        "build", "dist", ".cache", ".next", ".idea", ".vscode",
+    }
+    search_roots = [
+        HOME / "Work",
+        HOME / "src",
+        HOME / "code",
+        HOME / "projects",
+        HOME / "repos",
+    ]
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        root_parts = len(root.parts)
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            depth = len(Path(dirpath).parts) - root_parts
+            if depth >= max_depth:
+                dirnames[:] = []
+                continue
+            # Prune noisy subdirs early.
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            if ".opencode" in dirnames:
+                p = Path(dirpath) / ".opencode" / "opencode.db"
+                if p.is_file():
+                    try:
+                        resolved = p.resolve()
+                        if resolved not in seen:
+                            seen[resolved] = p.stat().st_mtime
+                    except OSError:
+                        pass
+                # Don't descend into .opencode itself.
+                dirnames.remove(".opencode")
+    return sorted(seen, key=lambda p: -seen[p])
+
+
+def _opencode_table_set(con: sqlite3.Connection) -> set[str]:
+    cur = con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    return {r[0] for r in cur.fetchall()}
+
+
+def _opencode_walk_current(con: sqlite3.Connection, db: Path) -> Iterator[Record]:
+    """Current schema: session / message / part.
+
+    We push as much work as possible down to SQLite using json_extract:
+      * message counts per session via a GROUP BY
+      * user-prompt text pulled directly as a column, joining message
+        to filter on role = 'user' at the DB layer
+    This keeps the Python pass O(sessions + user_text_parts), not O(parts).
+    """
+    cur = con.execute(
+        "SELECT id, directory, title, time_updated FROM session ORDER BY time_updated DESC"
+    )
+    sessions = cur.fetchall()
+    if not sessions:
+        return
+
+    # Message count per session (user + assistant only).
+    msg_count: dict[str, int] = {}
+    for sid, c in con.execute(
+        "SELECT session_id, COUNT(*) FROM message "
+        "WHERE data LIKE '%\"role\":\"user\"%' OR data LIKE '%\"role\":\"assistant\"%' "
+        "GROUP BY session_id"
+    ):
+        msg_count[sid] = c
+
+    # User-prompt text extracted in SQL. json_extract returns the string
+    # value of $.text. The LIKE pre-filter keeps the scan narrow.
+    user_prompts: dict[str, list[str]] = {}
+    for sid, text in con.execute(
+        """
+        SELECT p.session_id, json_extract(p.data, '$.text') AS txt
+        FROM part p
+        JOIN message m ON p.message_id = m.id
+        WHERE p.data LIKE '{"type":"text"%'
+          AND m.data LIKE '%"role":"user"%'
+          AND (json_extract(p.data, '$.synthetic') IS NULL
+               OR json_extract(p.data, '$.synthetic') = 0)
+        ORDER BY p.time_created ASC
+        """
+    ):
+        if text and is_real_prompt(text):
+            user_prompts.setdefault(sid, []).append(text)
+
+    for sid, directory, title, updated in sessions:
+        rec = Record(
+            agent="opencode",
+            session_id=sid,
+            source=f"sqlite:{db}",
+            updated=(updated or 0) / 1000.0,
+            msgs=msg_count.get(sid, 0),
+            cwd=directory or "",
+        )
+        prompts = user_prompts.get(sid, [])
+        if prompts:
+            rec.title = prompts[0]
+            for p in prompts:
+                rec.add_prompt(p)
+        if not rec.title:
+            rec.title = title or ""
+        yield rec
+
+
+def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]:
+    """Legacy schema: sessions / messages / files."""
+    cur = con.execute(
+        "SELECT id, title, message_count, updated_at FROM sessions ORDER BY updated_at DESC"
+    )
+    rows = cur.fetchall()
+    if not rows:
+        return
+    user_prompts: dict[str, list[str]] = {}
+    for sid, parts in con.execute(
+        "SELECT session_id, parts FROM messages WHERE role='user' ORDER BY created_at ASC"
+    ):
+        try:
+            p = json.loads(parts)
+        except Exception:
+            continue
+        if not isinstance(p, list):
+            continue
+        for part in p:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            tx = part.get("text") or (
+                (part.get("data") or {}).get("text")
+            ) or ""
+            if is_real_prompt(tx):
+                user_prompts.setdefault(sid, []).append(tx)
+                break
+    # cwd via files table (best-effort)
+    cwd_map: dict[str, str] = {}
+    try:
+        for sid, pth in con.execute(
+            "SELECT session_id, path FROM files GROUP BY session_id"
+        ):
+            if pth and pth.startswith("/"):
+                cwd_map[sid] = os.path.dirname(pth)
+    except sqlite3.Error:
+        pass
+    for sid, title, msgs, updated in rows:
+        updated_s = (
+            (updated or 0) / 1000.0
+            if (updated or 0) > 1_000_000_000_000
+            else (updated or 0)
+        )
+        rec = Record(
+            agent="opencode",
+            session_id=sid,
+            source=f"sqlite:{db}",
+            updated=updated_s,
+            msgs=msgs or 0,
+            cwd=cwd_map.get(sid, ""),
+            title="",
+        )
+        for p in user_prompts.get(sid, []):
+            if not rec.title:
+                rec.title = p
+            rec.add_prompt(p)
+        if not rec.title:
+            rec.title = title or ""
+        yield rec
+
+
+def walk_opencode() -> Iterator[Record]:
+    seen_sids: set[str] = set()
+    for db in _opencode_db_paths():
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        except sqlite3.Error as e:
+            print(f"opencode: cannot open {db}: {e}", file=sys.stderr)
+            continue
+        try:
+            tables = _opencode_table_set(con)
+            if {"session", "message", "part"}.issubset(tables):
+                walker = _opencode_walk_current(con, db)
+            elif {"sessions", "messages"}.issubset(tables):
+                walker = _opencode_walk_legacy(con, db)
+            else:
+                continue
+            for rec in walker:
+                if rec.session_id in seen_sids:
+                    continue
+                seen_sids.add(rec.session_id)
+                yield rec
+        except sqlite3.Error as e:
+            print(f"opencode: {db}: {e}", file=sys.stderr)
+        finally:
+            con.close()
+
+
+# --------------------------------------------------------------------------
+# Droid / Factory -- ~/.factory/sessions/<proj>/<uuid>.jsonl
+# --------------------------------------------------------------------------
+def walk_droid() -> Iterator[Record]:
+    root = HOME / ".factory" / "sessions"
+    if not root.is_dir():
+        return
+    for proj in root.iterdir():
+        if not proj.is_dir():
+            continue
+        for jf in proj.glob("*.jsonl"):
+            try:
+                rec = _read_droid_file(jf)
+                if rec:
+                    yield rec
+            except Exception as e:
+                print(f"droid: {jf}: {e}", file=sys.stderr)
+
+
+def _read_droid_file(path: Path) -> Optional[Record]:
+    sid = path.stem
+    rec = Record(
+        agent="droid",
+        session_id=sid,
+        source=str(path),
+        updated=path.stat().st_mtime,
+    )
+    title = ""
+    cwd = ""
+    msgs = 0
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "session_start":
+                if obj.get("cwd"):
+                    cwd = obj["cwd"]
+                if obj.get("title") and not title:
+                    title = obj["title"]
+            if t == "message":
+                m = obj.get("message") or {}
+                role = m.get("role")
+                if role in ("user", "assistant"):
+                    msgs += 1
+                if role == "user":
+                    for p in m.get("content") or []:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            tx = p.get("text", "")
+                            if is_real_prompt(tx):
+                                if not title:
+                                    title = tx
+                                rec.add_prompt(tx)
+            ts = obj.get("timestamp")
+            if ts:
+                e = iso_to_epoch(ts)
+                if e > rec.updated:
+                    rec.updated = e
+    rec.title = title
+    rec.cwd = cwd
+    rec.msgs = msgs
+    return rec
+
+
+# --------------------------------------------------------------------------
+# pi  -- ~/.pi/agent/sessions/<enc-cwd>/<iso>_<uuid>.jsonl
+# --------------------------------------------------------------------------
+def walk_pi() -> Iterator[Record]:
+    root = HOME / ".pi" / "agent" / "sessions"
+    if not root.is_dir():
+        return
+    for proj in root.iterdir():
+        if not proj.is_dir():
+            continue
+        for jf in proj.glob("*.jsonl"):
+            try:
+                rec = _read_pi_file(jf)
+                if rec:
+                    yield rec
+            except Exception as e:
+                print(f"pi: {jf}: {e}", file=sys.stderr)
+
+
+def _read_pi_file(path: Path) -> Optional[Record]:
+    # filename: 2026-04-02T12-02-19-290Z_<uuid>.jsonl
+    m = re.match(
+        r".*_([0-9a-f-]+)$",
+        path.stem,
+    )
+    sid = m.group(1) if m else path.stem
+    rec = Record(
+        agent="pi",
+        session_id=sid,
+        source=str(path),
+        updated=path.stat().st_mtime,
+    )
+    title = ""
+    cwd = ""
+    msgs = 0
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "session":
+                if obj.get("cwd"):
+                    cwd = obj["cwd"]
+                if obj.get("id"):
+                    rec.session_id = obj["id"]
+            if t == "message":
+                m = obj.get("message") or {}
+                role = m.get("role")
+                if role in ("user", "assistant"):
+                    msgs += 1
+                if role == "user":
+                    content = m.get("content")
+                    if isinstance(content, list):
+                        for p in content:
+                            if isinstance(p, dict) and p.get("type") == "text":
+                                tx = p.get("text", "")
+                                if is_real_prompt(tx):
+                                    if not title:
+                                        title = tx
+                                    rec.add_prompt(tx)
+                    elif isinstance(content, str):
+                        if is_real_prompt(content):
+                            if not title:
+                                title = content
+                            rec.add_prompt(content)
+            ts = obj.get("timestamp")
+            if ts:
+                e = iso_to_epoch(ts)
+                if e > rec.updated:
+                    rec.updated = e
+    rec.title = title
+    rec.cwd = cwd
+    rec.msgs = msgs
+    return rec
+
+
+# --------------------------------------------------------------------------
+WALKERS = {
+    "claude": walk_claude,
+    "codex": walk_codex,
+    "opencode": walk_opencode,
+    "droid": walk_droid,
+    "pi": walk_pi,
+}
+
+
+def main() -> int:
+    agents = sys.argv[1:] or list(WALKERS.keys())
+    records: list[Record] = []
+    for a in agents:
+        walker = WALKERS.get(a)
+        if not walker:
+            print(f"unknown agent: {a}", file=sys.stderr)
+            continue
+        try:
+            records.extend(walker())
+        except Exception as e:
+            print(f"{a}: {e}", file=sys.stderr)
+    records.sort(key=lambda r: r.updated, reverse=True)
+    out = sys.stdout
+    for r in records:
+        out.write(r.as_row())
+        out.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

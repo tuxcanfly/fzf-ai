@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""fzf-ai-preview <agent> <session_id> <source>
+
+Render a compact, readable preview of an AI coding session for fzf's preview
+window. Works for all agents handled by fzf-ai-index.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ANSI colors (respect NO_COLOR). fzf renders ANSI in the preview window.
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+
+def c(code: str, s: str) -> str:
+    if NO_COLOR:
+        return s
+    return f"\033[{code}m{s}\033[0m"
+
+
+BOLD = lambda s: c("1", s)
+DIM = lambda s: c("2", s)
+CYAN = lambda s: c("36", s)
+GREEN = lambda s: c("32", s)
+YELLOW = lambda s: c("33", s)
+MAGENTA = lambda s: c("35", s)
+RED = lambda s: c("31", s)
+BLUE = lambda s: c("34", s)
+
+ROLE_COLOR = {
+    "user": CYAN,
+    "assistant": GREEN,
+    "system": DIM,
+    "tool": YELLOW,
+}
+
+
+def term_width() -> int:
+    try:
+        cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", "0")) or shutil.get_terminal_size((100, 40)).columns
+    except Exception:
+        cols = 100
+    return max(40, cols)
+
+
+def wrap(text: str, indent: str = "  ") -> str:
+    w = term_width() - len(indent) - 1
+    if w < 20:
+        w = 60
+    out = []
+    for line in text.splitlines() or [""]:
+        if not line:
+            out.append(indent)
+            continue
+        out.extend(
+            textwrap.wrap(
+                line,
+                width=w,
+                initial_indent=indent,
+                subsequent_indent=indent,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or [indent]
+        )
+    return "\n".join(out)
+
+
+def header(agent: str, sid: str, source: str, cwd: str = "") -> str:
+    lines = [
+        BOLD(f"{agent}") + DIM(f"  {sid}"),
+    ]
+    if cwd:
+        lines.append(DIM("cwd  ") + cwd)
+    lines.append(DIM("src  ") + source)
+    lines.append(DIM("─" * term_width()))
+    return "\n".join(lines)
+
+
+def render_message(role: str, text: str, ts: str = "") -> str:
+    color = ROLE_COLOR.get(role, lambda s: s)
+    tag = f"{role.upper():<9}"
+    head = color(BOLD(tag)) + (DIM(f" {ts}") if ts else "")
+    body = wrap(text.strip(), "  ")
+    return head + "\n" + body
+
+
+def extract_text(parts):
+    """Extract concatenated text from a content list/string in many shapes."""
+    if parts is None:
+        return ""
+    if isinstance(parts, str):
+        return parts
+    if isinstance(parts, list):
+        chunks = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            t = p.get("type")
+            if t == "text":
+                tx = p.get("text")
+                if tx is None:
+                    tx = (p.get("data") or {}).get("text")
+                if tx:
+                    chunks.append(tx)
+            elif t == "tool_use":
+                name = p.get("name", "tool")
+                inp = p.get("input")
+                chunks.append(f"⟨tool:{name}⟩ {json.dumps(inp)[:200]}")
+            elif t == "tool_result":
+                content = p.get("content")
+                if isinstance(content, list):
+                    for cc in content:
+                        if isinstance(cc, dict) and cc.get("type") == "text":
+                            chunks.append(f"⟨result⟩ {cc.get('text','')[:300]}")
+                else:
+                    chunks.append(f"⟨result⟩ {str(content)[:300]}")
+            elif t in ("input_text", "output_text"):
+                tx = p.get("text", "")
+                if tx:
+                    chunks.append(tx)
+            elif t == "reasoning":
+                summaries = p.get("summary") or []
+                for s in summaries:
+                    if isinstance(s, dict) and s.get("type") == "summary_text":
+                        chunks.append("⟨reasoning⟩ " + (s.get("text") or ""))
+        return "\n".join(chunks)
+    return str(parts)
+
+
+def fmt_ts(ts) -> str:
+    if not ts:
+        return ""
+    if isinstance(ts, (int, float)):
+        try:
+            return (
+                datetime.fromtimestamp(ts / 1000 if ts > 1e12 else ts, tz=timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%S")
+            )
+        except Exception:
+            return ""
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            return ts
+    return ""
+
+
+# ---------------------------------------------------------------
+def preview_jsonl(
+    path: Path,
+    agent: str,
+    sid: str,
+    max_msgs: int = 20,
+) -> str:
+    lines = []
+    cwd = ""
+    total = 0
+    shown = 0
+    model = ""
+    messages = []
+    if not path.is_file():
+        return RED(f"file not found: {path}")
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if agent == "claude":
+                if obj.get("cwd") and not cwd:
+                    cwd = obj["cwd"]
+                if obj.get("type") in ("user", "assistant"):
+                    if obj.get("isMeta"):
+                        continue
+                    m = obj.get("message") or {}
+                    role = m.get("role") or obj["type"]
+                    text = extract_text(m.get("content"))
+                    if text:
+                        ts = fmt_ts(obj.get("timestamp"))
+                        messages.append((role, text, ts))
+                        total += 1
+            elif agent == "codex":
+                p = obj.get("payload") or {}
+                t = obj.get("type")
+                if t == "session_meta":
+                    if p.get("cwd") and not cwd:
+                        cwd = p["cwd"]
+                if t == "response_item" and p.get("type") == "message":
+                    role = p.get("role")
+                    text = extract_text(p.get("content"))
+                    if text:
+                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                        total += 1
+                elif t == "response_item" and p.get("type") == "reasoning":
+                    text = extract_text([p])
+                    if text:
+                        messages.append(("assistant", text, fmt_ts(obj.get("timestamp"))))
+                        total += 1
+            elif agent == "droid":
+                t = obj.get("type")
+                if t == "session_start":
+                    if obj.get("cwd") and not cwd:
+                        cwd = obj["cwd"]
+                elif t == "message":
+                    m = obj.get("message") or {}
+                    role = m.get("role")
+                    text = extract_text(m.get("content"))
+                    if text:
+                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                        total += 1
+            elif agent == "pi":
+                t = obj.get("type")
+                if t == "session":
+                    if obj.get("cwd") and not cwd:
+                        cwd = obj["cwd"]
+                elif t == "model_change":
+                    model = obj.get("modelId") or model
+                elif t == "message":
+                    m = obj.get("message") or {}
+                    role = m.get("role")
+                    text = extract_text(m.get("content"))
+                    if text:
+                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                        total += 1
+
+    parts = [header(agent, sid, str(path), cwd)]
+    parts.append(
+        DIM(f"{total} messages")
+        + (DIM(f"  model={model}") if model else "")
+    )
+    parts.append("")
+    # Show first few + last few for context
+    head_count = min(3, len(messages))
+    tail_count = min(max_msgs - head_count, len(messages) - head_count)
+    shown_msgs = messages[:head_count]
+    if tail_count > 0 and len(messages) > head_count:
+        if len(messages) - head_count > tail_count:
+            parts.append(
+                DIM(f"    … ({len(messages) - head_count - tail_count} messages hidden) …")
+            )
+            parts.append("")
+            shown_msgs += messages[-tail_count:]
+        else:
+            shown_msgs += messages[head_count:]
+    for role, text, ts in shown_msgs:
+        parts.append(render_message(role, text, ts))
+        parts.append("")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------
+def preview_opencode(sid: str, db_path: str) -> str:
+    db = Path(db_path.replace("sqlite:", ""))
+    if not db.is_file():
+        return RED(f"db not found: {db}")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        tables = {
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if {"session", "message", "part"}.issubset(tables):
+            return _preview_opencode_current(con, db, sid)
+        if {"sessions", "messages"}.issubset(tables):
+            return _preview_opencode_legacy(con, db, sid)
+        return RED(f"{db}: unknown opencode schema")
+    finally:
+        con.close()
+
+
+def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str) -> str:
+    row = con.execute(
+        "SELECT id, directory, title, time_updated FROM session WHERE id=?",
+        (sid,),
+    ).fetchone()
+    if not row:
+        return RED(f"session not found: {sid}")
+    _, directory, title, updated = row
+    lines = [header("opencode", sid, f"sqlite:{db}", cwd=directory or "")]
+    lines.append(BOLD(title or "(untitled)"))
+    lines.append(DIM(f"updated {fmt_ts(updated)}"))
+    lines.append("")
+
+    # Collect messages ordered by time; fetch parts grouped by message.
+    msgs = con.execute(
+        "SELECT id, data, time_created FROM message WHERE session_id=? ORDER BY time_created ASC",
+        (sid,),
+    ).fetchall()
+    total = len(msgs)
+    if total == 0:
+        return "\n".join(lines)
+
+    # Pre-fetch parts for all messages in one go.
+    parts_by_msg: dict[str, list] = {}
+    for mid, pdata, _tc in con.execute(
+        "SELECT message_id, data, time_created FROM part WHERE session_id=? ORDER BY time_created ASC",
+        (sid,),
+    ):
+        try:
+            parts_by_msg.setdefault(mid, []).append(json.loads(pdata))
+        except Exception:
+            pass
+
+    # Pick messages to show: first 3 + last 3
+    show_indices = list(range(min(3, total)))
+    if total > 6:
+        show_indices += list(range(max(3, total - 3), total))
+    hidden = total - len(show_indices)
+    prev_i = -2
+    for i in show_indices:
+        mid, mdata, tc = msgs[i]
+        if i > prev_i + 1 and hidden > 0:
+            lines.append(DIM(f"    … ({hidden} messages hidden) …"))
+            lines.append("")
+        try:
+            d = json.loads(mdata)
+        except Exception:
+            d = {}
+        role = d.get("role", "?")
+        text = extract_text(parts_by_msg.get(mid) or [])
+        if text:
+            lines.append(render_message(role, text, fmt_ts(tc)))
+            lines.append("")
+        prev_i = i
+    return "\n".join(lines)
+
+
+def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str) -> str:
+    cur = con.execute(
+        "SELECT id,title,message_count,cost,prompt_tokens,completion_tokens,updated_at "
+        "FROM sessions WHERE id=?",
+        (sid,),
+    )
+    row = cur.fetchone()
+    if not row:
+        return RED(f"session not found: {sid}")
+    _, title, mcount, cost, pt, ct, updated = row
+    lines = [header("opencode", sid, f"sqlite:{db}")]
+    lines.append(BOLD(title or "(untitled)"))
+    lines.append(
+        DIM(
+            f"{mcount} msgs  ·  ${cost:.4f}  ·  {pt} in / {ct} out  ·  updated {fmt_ts(updated)}"
+        )
+    )
+    lines.append("")
+    cur2 = con.execute(
+        "SELECT role,parts,created_at FROM messages WHERE session_id=? ORDER BY created_at ASC",
+        (sid,),
+    )
+    rows = cur2.fetchall()
+    total = len(rows)
+    show_indices = list(range(min(3, total)))
+    if total > 6:
+        show_indices += list(range(max(3, total - 3), total))
+    hidden = total - len(show_indices)
+    prev_i = -2
+    for i in show_indices:
+        role, parts_json, created = rows[i]
+        if i > prev_i + 1 and hidden > 0:
+            lines.append(DIM(f"    … ({hidden} messages hidden) …"))
+            lines.append("")
+        try:
+            p = json.loads(parts_json)
+        except Exception:
+            p = []
+        text = extract_text(p)
+        if text:
+            lines.append(render_message(role, text, fmt_ts(created)))
+            lines.append("")
+        prev_i = i
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------
+def main() -> int:
+    if len(sys.argv) < 4:
+        print("usage: fzf-ai-preview <agent> <session_id> <source>", file=sys.stderr)
+        return 2
+    agent, sid, source = sys.argv[1], sys.argv[2], sys.argv[3]
+    try:
+        if agent == "opencode":
+            out = preview_opencode(sid, source)
+        else:
+            out = preview_jsonl(Path(source), agent, sid)
+        sys.stdout.write(out)
+        sys.stdout.write("\n")
+    except BrokenPipeError:
+        pass
+    except Exception as e:
+        print(RED(f"preview error: {e}"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

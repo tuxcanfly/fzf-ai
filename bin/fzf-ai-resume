@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# fzf-ai-resume <agent> <session_id> <source> [cwd]
+#
+# cd into the session's original working directory (if it still exists) and
+# re-launch the correct CLI with the correct resume flag.
+set -euo pipefail
+
+agent=${1:?agent required}
+sid=${2:?session id required}
+source=${3:-}
+cwd=${4:-}
+
+# Expand "~/…" we emit from the indexer back to $HOME. Use a literal tilde
+# pattern so bash doesn't do its own tilde expansion inside the substitution.
+case "$cwd" in
+  "~")        cwd="$HOME" ;;
+  "~/"*)      cwd="$HOME/${cwd#\~/}" ;;
+esac
+
+cd_ok=0
+if [[ -n "$cwd" && -d "$cwd" ]]; then
+  cd "$cwd" && cd_ok=1
+fi
+
+case "$agent" in
+  claude)
+    # claude resumes from cwd; if we couldn't cd, it still works but the
+    # session's file references may be wrong.
+    exec claude --resume "$sid"
+    ;;
+  codex)
+    # Pass -C explicitly so codex never prompts to switch directories. When
+    # we know the cwd we feed it; otherwise we leave codex to use the pwd.
+    if (( cd_ok )); then
+      exec codex resume -C "$cwd" "$sid"
+    else
+      exec codex resume "$sid"
+    fi
+    ;;
+  opencode)
+    # opencode takes the project directory as a positional and the session
+    # id via --session. Passing the directory explicitly means we don't
+    # even need to cd.
+    if [[ -n "$cwd" && -d "$cwd" ]]; then
+      exec opencode "$cwd" --session "$sid"
+    else
+      exec opencode --session "$sid"
+    fi
+    ;;
+  droid)
+    exec droid --resume "$sid"
+    ;;
+  pi)
+    # pi supports both: --resume <id> and --session <path>. The path form is
+    # the most reliable because pi organises sessions by encoded cwd.
+    if [[ -n "$source" && -f "$source" ]]; then
+      exec pi --session "$source"
+    else
+      exec pi --resume "$sid"
+    fi
+    ;;
+  *)
+    echo "fzf-ai-resume: unknown agent '$agent'" >&2
+    exit 2
+    ;;
+esac

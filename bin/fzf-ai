@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# fzf-ai: fuzzy browser for AI coding sessions across claude, codex,
+# opencode, droid, and pi. Selecting an item resumes it in its native CLI.
+#
+# Keybinds (shown in fzf header):
+#   enter    resume the session in its tool
+#   ctrl-o   cd into the session's working directory in a new shell
+#   ctrl-e   open the raw session file in $EDITOR
+#   ctrl-y   copy session id to the clipboard (pbcopy / xclip / wl-copy)
+#   ctrl-r   reload the index
+#   tab      multi-select (batch ops would go here)
+#   ?        toggle preview
+#   alt-p    cycle preview position
+#   alt-1..5 filter to one agent only
+#   alt-0    clear filter
+set -euo pipefail
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+INDEX="$SCRIPT_DIR/fzf-ai-index"
+PREVIEW="$SCRIPT_DIR/fzf-ai-preview"
+RESUME="$SCRIPT_DIR/fzf-ai-resume"
+
+if ! command -v fzf >/dev/null 2>&1; then
+  echo "fzf-ai: fzf is required (https://github.com/junegunn/fzf)" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "fzf-ai: python3 is required" >&2
+  exit 1
+fi
+
+# --- Index column layout -------------------------------------------------
+# The indexer emits 9 TAB-separated columns per line:
+#   1 agent-raw   2 session_id  3 source        (hidden, machine-only)
+#   4 agent-badge 5 updated     6 msgs          (visible, padded)
+#   7 cwd         8 title                       (visible)
+#   9 search-blob (hidden from view, searchable) -- concatenated user prompts
+# --------------------------------------------------------------------------
+
+copy_cmd() {
+  if command -v pbcopy >/dev/null 2>&1; then echo pbcopy; return; fi
+  if command -v wl-copy >/dev/null 2>&1; then echo wl-copy; return; fi
+  if command -v xclip  >/dev/null 2>&1; then echo "xclip -selection clipboard"; return; fi
+  echo ""
+}
+COPY=$(copy_cmd)
+
+# Agents can be filtered with args: `fzf-ai claude codex`
+AGENTS=("$@")
+
+# Export the children scripts so fzf bindings can call them.
+export FZFAI_PREVIEW="$PREVIEW"
+export FZFAI_RESUME="$RESUME"
+export FZFAI_INDEX="$INDEX"
+export FZFAI_AGENTS="${AGENTS[*]:-}"
+export FZFAI_COPY="$COPY"
+
+# Preview command: index record passed via positional expansion.
+#   {1}=agent {2}=sid {3}=source {7}=cwd {8}=title
+PREVIEW_CMD='"$FZFAI_PREVIEW" {1} {2} {3}'
+
+# Reload command re-runs the indexer, optionally filtered to named agents.
+RELOAD_CMD='"$FZFAI_INDEX" $FZFAI_AGENTS'
+
+HEADER=$'searches: agent · cwd · title · all user prompts\nenter: resume  ·  ctrl-o: cd shell  ·  ctrl-e: edit  ·  ctrl-y: copy id  ·  ctrl-r: reload  ·  ?: preview  ·  alt-1..5: filter agent'
+
+# Resume command used by enter -- uses `become` so fzf exec()s it directly,
+# handing the terminal to the AI CLI with no extra subshell.
+RESUME_CMD='"$FZFAI_RESUME" {1} {2} {3} {7}'
+
+"$INDEX" "${AGENTS[@]}" \
+| fzf \
+    --ansi \
+    --delimiter=$'\t' \
+    --with-nth='4,5,6,7,8,9' \
+    --nth='1,4,5,6' \
+    --no-sort \
+    --tiebreak=index \
+    --info=inline-right \
+    --height=100% \
+    --layout=reverse \
+    --border=rounded \
+    --border-label=' AI coding sessions ' \
+    --border-label-pos=3 \
+    --prompt='ai> ' \
+    --pointer='▶' \
+    --marker='✓' \
+    --header="$HEADER" \
+    --header-lines=0 \
+    --preview="$PREVIEW_CMD" \
+    --preview-window='right,60%,border-left,wrap,~3' \
+    --bind="enter:become($RESUME_CMD)" \
+    --bind="ctrl-r:reload($RELOAD_CMD)" \
+    --bind='?:toggle-preview' \
+    --bind='alt-p:change-preview-window(down,60%|right,75%|right,60%)' \
+    --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)" \
+    --bind="ctrl-e:execute(\${EDITOR:-vi} {3})" \
+    --bind="ctrl-y:execute-silent(printf %s {2} | \$FZFAI_COPY)" \
+    --bind="alt-1:reload(\"\$FZFAI_INDEX\" claude)" \
+    --bind="alt-2:reload(\"\$FZFAI_INDEX\" codex)" \
+    --bind="alt-3:reload(\"\$FZFAI_INDEX\" opencode)" \
+    --bind="alt-4:reload(\"\$FZFAI_INDEX\" droid)" \
+    --bind="alt-5:reload(\"\$FZFAI_INDEX\" pi)" \
+    --bind="alt-0:reload($RELOAD_CMD)"

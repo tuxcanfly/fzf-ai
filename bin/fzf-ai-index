@@ -33,8 +33,13 @@ from typing import Iterable, Iterator, Optional
 HOME = Path(os.path.expanduser("~"))
 
 MAX_TITLE = 120
-MAX_SEARCH_BLOB = 4000   # per session, enough for fuzzy search
-MAX_SEARCH_PROMPT = 400  # per prompt
+# Keep the search blob small so that fuzzy matching stays high-signal.
+# Long soups of text are easy to accidentally match against, which floods
+# the picker with irrelevant rows whenever the query shares common letters
+# with filler content. 1200 chars is enough to hold ~10 distinctive prompt
+# openings per session.
+MAX_SEARCH_BLOB = 1200
+MAX_SEARCH_PROMPT = 140  # first part of each prompt only
 
 # Colors for the agent tag in the main list (fzf with --ansi renders these).
 _AGENT_COLOR = {
@@ -300,55 +305,27 @@ def _read_codex_file(path: Path) -> Optional[Record]:
 #               tables: sessions, messages, files  (flat)
 #   * per-project: <repo>/.opencode/opencode.db  (same legacy layout)
 # --------------------------------------------------------------------------
-def _opencode_db_paths(max_depth: int = 4) -> list[Path]:
-    """Return every opencode db on disk, newest first.
+def _opencode_db_paths() -> list[Path]:
+    """Return the opencode databases that actually back live sessions.
 
-    We find per-project ``<repo>/.opencode/opencode.db`` files by a
-    bounded-depth os.walk (rather than ``rglob('**')``) because the latter
-    takes 5-10 s on a large work tree.
+    Opencode >=1.x consolidated all sessions into a single global database
+    at ``~/.local/share/opencode/opencode.db``. The legacy
+    ``~/.opencode/opencode.db`` and any per-project ``<repo>/.opencode/...``
+    databases are leftovers from older versions whose sessions are not
+    resumable by the current CLI, so we deliberately skip them to avoid
+    surfacing ghost sessions that fail on resume.
     """
     seen: dict[Path, float] = {}
-    candidates = [
-        HOME / ".local" / "share" / "opencode" / "opencode.db",
-        HOME / ".opencode" / "opencode.db",
-    ]
-    for c in candidates:
-        if c.is_file():
-            seen[c.resolve()] = c.stat().st_mtime
-
-    skip_dirs = {
-        ".git", "node_modules", ".venv", "venv", "__pycache__", "target",
-        "build", "dist", ".cache", ".next", ".idea", ".vscode",
-    }
-    search_roots = [
-        HOME / "Work",
-        HOME / "src",
-        HOME / "code",
-        HOME / "projects",
-        HOME / "repos",
-    ]
-    for root in search_roots:
-        if not root.is_dir():
-            continue
-        root_parts = len(root.parts)
-        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-            depth = len(Path(dirpath).parts) - root_parts
-            if depth >= max_depth:
-                dirnames[:] = []
-                continue
-            # Prune noisy subdirs early.
-            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-            if ".opencode" in dirnames:
-                p = Path(dirpath) / ".opencode" / "opencode.db"
-                if p.is_file():
-                    try:
-                        resolved = p.resolve()
-                        if resolved not in seen:
-                            seen[resolved] = p.stat().st_mtime
-                    except OSError:
-                        pass
-                # Don't descend into .opencode itself.
-                dirnames.remove(".opencode")
+    candidate = HOME / ".local" / "share" / "opencode" / "opencode.db"
+    if candidate.is_file():
+        seen[candidate.resolve()] = candidate.stat().st_mtime
+    # Also include the legacy db only if the current one doesn't exist at
+    # all (fresh migration case). Skipping it otherwise prevents duplicate
+    # or unresumable entries from cluttering the picker.
+    if not seen:
+        legacy = HOME / ".opencode" / "opencode.db"
+        if legacy.is_file():
+            seen[legacy.resolve()] = legacy.stat().st_mtime
     return sorted(seen, key=lambda p: -seen[p])
 
 

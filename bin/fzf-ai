@@ -8,12 +8,11 @@
 #   ctrl-e   open the raw session file in $EDITOR
 #   ctrl-y   copy session id to the clipboard (pbcopy / xclip / wl-copy)
 #   ctrl-r   reload the index
-#   tab      multi-select (batch ops would go here)
 #   ?        toggle preview
 #   alt-p    cycle preview position
 #   alt-1..5 filter to one agent only
 #   alt-0    clear filter
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 INDEX="$SCRIPT_DIR/fzf-ai-index"
@@ -34,7 +33,9 @@ fi
 #   1 agent-raw   2 session_id  3 source        (hidden, machine-only)
 #   4 agent-badge 5 updated     6 msgs          (visible, padded)
 #   7 cwd         8 title                       (visible)
-#   9 search-blob (hidden from view, searchable) -- concatenated user prompts
+#   9 search-blob (rendered but off-screen)     -- concat of user prompts
+# fzf's --nth indexes into the --with-nth view, so the visible columns
+# are: 4,5,6,7,8,9  = positions 1,2,3,4,5,6 in the transformed view.
 # --------------------------------------------------------------------------
 
 copy_cmd() {
@@ -62,43 +63,78 @@ PREVIEW_CMD='"$FZFAI_PREVIEW" {1} {2} {3}'
 # Reload command re-runs the indexer, optionally filtered to named agents.
 RELOAD_CMD='"$FZFAI_INDEX" $FZFAI_AGENTS'
 
-HEADER=$'searches: agent · cwd · title · all user prompts\nenter: resume  ·  ctrl-o: cd shell  ·  ctrl-e: edit  ·  ctrl-y: copy id  ·  ctrl-r: reload  ·  ?: preview  ·  alt-1..5: filter agent'
+HEADER=$'exact-match default  ·  \'word = fuzzy  ·  space = AND  ·  !w = exclude  ·  ^w / w$ = prefix / suffix\nctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-y: copy id  ·  ctrl-r: reload  ·  ?: preview  ·  alt-1..5: filter agent'
 
-# Resume command used by enter -- uses `become` so fzf exec()s it directly,
-# handing the terminal to the AI CLI with no extra subshell.
-RESUME_CMD='"$FZFAI_RESUME" {1} {2} {3} {7}'
+# -------------------------------------------------------------------------
+# Run fzf and capture the selected row. We deliberately do NOT use the
+# `become` action here. `become` exec()s the target command from inside
+# fzf, which we observed leaving the terminal in a state that breaks
+# cleanly-written TUIs (codex hangs, opencode input freezes). Capturing
+# the selection instead lets fzf fully tear down its altscreen and
+# restore the terminal before we launch the target CLI.
+# -------------------------------------------------------------------------
+selection=$(
+  "$INDEX" "${AGENTS[@]}" \
+  | fzf \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth='4,5,6,7,8,9' \
+      --nth='1,4,5,6' \
+      --scheme=default \
+      --exact \
+      --no-sort \
+      --tiebreak=chunk,begin,length \
+      --info=inline-right \
+      --height=100% \
+      --layout=reverse \
+      --border=rounded \
+      --border-label=' AI coding sessions ' \
+      --border-label-pos=3 \
+      --prompt='ai> ' \
+      --pointer='▶' \
+      --marker='✓' \
+      --header="$HEADER" \
+      --header-lines=0 \
+      --preview="$PREVIEW_CMD" \
+      --preview-window='right,60%,border-left,wrap,~3' \
+      --expect=enter \
+      --bind="ctrl-r:reload($RELOAD_CMD)" \
+      --bind='?:toggle-preview' \
+      --bind='alt-p:change-preview-window(down,60%|right,75%|right,60%)' \
+      --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)" \
+      --bind="ctrl-e:execute(\${EDITOR:-vi} {3})" \
+      --bind="ctrl-y:execute-silent(printf %s {2} | \$FZFAI_COPY)" \
+      --bind="alt-1:reload(\"\$FZFAI_INDEX\" claude)" \
+      --bind="alt-2:reload(\"\$FZFAI_INDEX\" codex)" \
+      --bind="alt-3:reload(\"\$FZFAI_INDEX\" opencode)" \
+      --bind="alt-4:reload(\"\$FZFAI_INDEX\" droid)" \
+      --bind="alt-5:reload(\"\$FZFAI_INDEX\" pi)" \
+      --bind="alt-0:reload($RELOAD_CMD)"
+)
+fzf_rc=$?
 
-"$INDEX" "${AGENTS[@]}" \
-| fzf \
-    --ansi \
-    --delimiter=$'\t' \
-    --with-nth='4,5,6,7,8,9' \
-    --nth='1,4,5,6' \
-    --no-sort \
-    --tiebreak=index \
-    --info=inline-right \
-    --height=100% \
-    --layout=reverse \
-    --border=rounded \
-    --border-label=' AI coding sessions ' \
-    --border-label-pos=3 \
-    --prompt='ai> ' \
-    --pointer='▶' \
-    --marker='✓' \
-    --header="$HEADER" \
-    --header-lines=0 \
-    --preview="$PREVIEW_CMD" \
-    --preview-window='right,60%,border-left,wrap,~3' \
-    --bind="enter:become($RESUME_CMD)" \
-    --bind="ctrl-r:reload($RELOAD_CMD)" \
-    --bind='?:toggle-preview' \
-    --bind='alt-p:change-preview-window(down,60%|right,75%|right,60%)' \
-    --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)" \
-    --bind="ctrl-e:execute(\${EDITOR:-vi} {3})" \
-    --bind="ctrl-y:execute-silent(printf %s {2} | \$FZFAI_COPY)" \
-    --bind="alt-1:reload(\"\$FZFAI_INDEX\" claude)" \
-    --bind="alt-2:reload(\"\$FZFAI_INDEX\" codex)" \
-    --bind="alt-3:reload(\"\$FZFAI_INDEX\" opencode)" \
-    --bind="alt-4:reload(\"\$FZFAI_INDEX\" droid)" \
-    --bind="alt-5:reload(\"\$FZFAI_INDEX\" pi)" \
-    --bind="alt-0:reload($RELOAD_CMD)"
+# Exit gracefully on ESC / ctrl-c / no match.
+if [[ $fzf_rc -ne 0 && $fzf_rc -ne 1 ]]; then
+  exit $fzf_rc
+fi
+[[ -z "$selection" ]] && exit 0
+
+# --expect=enter prints the key name (or empty line for the default enter
+# binding) on the first line and the selected row on the second.
+row=$(printf '%s\n' "$selection" | sed -n '2p')
+[[ -z "$row" ]] && exit 0
+
+# Columns: 1 agent  2 sid  3 source  4 badge  5 date  6 msgs  7 cwd  8 title  9 blob
+IFS=$'\t' read -r agent sid source _badge _date _msgs cwd _title _blob <<<"$row"
+# The cwd column is space-padded for UI alignment; strip trailing spaces.
+cwd=${cwd%"${cwd##*[![:space:]]}"}
+
+if [[ -z "$agent" || -z "$sid" ]]; then
+  echo "fzf-ai: could not parse selected row" >&2
+  exit 2
+fi
+
+# With fzf cleanly torn down, the terminal is back in a normal state
+# before we exec the AI CLI. This is what fixes the "input freeze" and
+# "codex hangs" issues we saw with the `become` approach.
+exec "$RESUME" "$agent" "$sid" "$source" "$cwd"

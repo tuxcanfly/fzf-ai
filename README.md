@@ -18,24 +18,28 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
 * **Indexes every session** on disk:
   * claude ─ `~/.claude/projects/<proj>/<uuid>.jsonl`
   * codex  ─ `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
-  * opencode ─ **sqlite** — current layout (`~/.local/share/opencode/opencode.db`:
-    `session` / `message` / `part`), legacy layout (`~/.opencode/opencode.db`:
-    `sessions` / `messages` / `files`), and per-project
-    `<repo>/.opencode/opencode.db` files found by a bounded os.walk
+  * opencode ─ the global sqlite db at `~/.local/share/opencode/opencode.db`
+    (tables `session` / `message` / `part`). Legacy per-project
+    `<repo>/.opencode/opencode.db` files are deliberately skipped — those
+    sessions are not resumable by current opencode and just created
+    ghost rows.
   * droid  ─ `~/.factory/sessions/<proj>/<uuid>.jsonl`
   * pi     ─ `~/.pi/agent/sessions/<proj>/<iso>_<uuid>.jsonl`
 * Sorts newest-first and shows a rich ANSI preview of the real conversation
   (first prompt, last replies, tool calls, reasoning, model, cwd).
-* **Fuzzy search covers agent / cwd / title / every user prompt** in every
-  session — a hidden 9th column concatenates all user inputs and is included
-  in `--nth`, so searching for any phrase you ever typed finds the session.
-* On **enter**, fzf `become()`s the correct CLI, cd'd into the session's
-  original directory:
+* **Exact-match by default** across agent / cwd / title / user prompts.
+  fzf runs with `--exact`, so typing `noita` finds sessions containing
+  `noita`. Use `'word` to fall back to fuzzy for a single term, `!word`
+  to exclude, `^word` / `word$` for prefix / suffix.
+* On **enter**, fzf exits cleanly, then the launcher `exec`s the correct
+  CLI from the session's original cwd. Using `exec`-after-exit (rather
+  than fzf's `become` action) avoids a terminal-state race that caused
+  codex to hang and opencode's input to freeze on hand-off.
   * `claude --resume <id>`
   * `codex resume -C <cwd> <id>`   (explicit `-C` suppresses codex's
     interactive "change directory?" prompt)
   * `opencode <cwd> --session <id>` (passes the project dir as positional
-    so it resolves to the right db)
+    so opencode opens the correct db and finds the session)
   * `droid --resume <id>`
   * `pi --session <path>` (preferred) or `pi --resume <id>`
 
@@ -49,7 +53,8 @@ ln -s "$PWD/bin/fzf-ai-preview"  ~/.local/bin/fzf-ai-preview
 ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 ```
 
-Requires: `fzf` ≥ 0.44 (needs `become`), `python3`, `sqlite3` (stdlib in python).
+Requires: `fzf` ≥ 0.50, `python3` (stdlib only), each AI CLI you want to
+resume on your `$PATH`.
 
 ## Usage
 
@@ -57,6 +62,18 @@ Requires: `fzf` ≥ 0.44 (needs `become`), `python3`, `sqlite3` (stdlib in pytho
 fzf-ai                    # browse everything
 fzf-ai claude codex       # only these agents
 ```
+
+### Search syntax (exact-match by default)
+
+| query             | meaning                                    |
+|-------------------|--------------------------------------------|
+| `noita`           | contains `noita`                           |
+| `noita webgpu`    | contains `noita` AND contains `webgpu`     |
+| `'word`           | fuzzy-match for this term (unquote)        |
+| `^use`            | starts with `use`                          |
+| `.md$`            | ends with `.md`                            |
+| `!draft`          | excludes items containing `draft`          |
+| `a | b | c`       | OR                                         |
 
 ### Keys
 

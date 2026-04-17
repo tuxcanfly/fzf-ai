@@ -26,11 +26,20 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
   * droid  ─ `~/.factory/sessions/<proj>/<uuid>.jsonl`
   * pi     ─ `~/.pi/agent/sessions/<proj>/<iso>_<uuid>.jsonl`
 * Sorts newest-first and shows a rich ANSI preview of the real conversation
-  (first prompt, last replies, tool calls, reasoning, model, cwd).
+  (first real prompt, last user prompt, recent replies, tool calls,
+  reasoning, model, cwd). Boilerplate environment / policy blocks are
+  hidden from the preview when possible.
 * **Exact-match by default** across agent / cwd / title / user prompts.
   fzf runs with `--exact`, so typing `noita` finds sessions containing
   `noita`. Use `'word` to fall back to fuzzy for a single term, `!word`
   to exclude, `^word` / `word$` for prefix / suffix.
+* Uses newer `fzf` features to make the picker behave like a small TUI:
+  * `reload-sync` for clean initial load and reindex without flicker
+  * `change-nth` + `FZF_NTH` to switch search scopes on the fly
+  * `click-header` so the scope tags in the header are clickable
+  * `bg-transform-*` + `{*f}` to render a live footer summary of matches
+  * `--history` for persistent query history between runs
+  * `--tmux` so it opens in a popup automatically when run inside tmux
 * On **enter**, fzf exits cleanly, then the launcher `exec`s the correct
   CLI from the session's original cwd. Using `exec`-after-exit (rather
   than fzf's `become` action) avoids a terminal-state race that caused
@@ -53,7 +62,7 @@ ln -s "$PWD/bin/fzf-ai-preview"  ~/.local/bin/fzf-ai-preview
 ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 ```
 
-Requires: `fzf` ≥ 0.50, `python3` (stdlib only), each AI CLI you want to
+Requires: `fzf` ≥ 0.63, `python3` (stdlib only), each AI CLI you want to
 resume on your `$PATH`.
 
 ## Usage
@@ -77,25 +86,58 @@ fzf-ai claude codex       # only these agents
 
 ### Keys
 
-| key            | action                                            |
-|----------------|---------------------------------------------------|
-| `enter`        | resume session in its native CLI (cd to its cwd) |
-| `ctrl-o`       | open a shell in the session's working directory  |
-| `ctrl-e`       | open the raw `.jsonl` in `$EDITOR`               |
-| `ctrl-y`       | copy session id to clipboard                     |
-| `ctrl-r`       | reload the index                                 |
-| `?`            | toggle preview pane                              |
-| `alt-p`        | cycle preview position (right / down / wide)     |
-| `alt-1..5`     | filter to claude / codex / opencode / droid / pi |
-| `alt-0`        | clear filter                                     |
+| key            | action                                              |
+|----------------|-----------------------------------------------------|
+| `enter`        | resume session in its native CLI (cd to its cwd)   |
+| `ctrl-o`       | open a shell in the session's working directory    |
+| `ctrl-e`       | open the raw `.jsonl` / sqlite source in `$EDITOR` |
+| `ctrl-y`       | copy session id to clipboard                       |
+| `ctrl-k`       | copy the exact resume command to clipboard         |
+| `ctrl-p`       | move up                                            |
+| `ctrl-n`       | move down                                          |
+| `ctrl-r`       | rebuild the index in place                         |
+| `ctrl-s`       | cycle search scope: `all → cwd → title → prompts → id → agent` |
+| `?`            | toggle preview pane                                |
+| `alt-p`        | cycle preview position / hide preview              |
+| `alt-1..5`     | filter to claude / codex / opencode / droid / pi   |
+| `alt-0`        | clear the temporary agent filter                   |
+
+### Scope Switching
+
+The header is clickable. Click `[all]`, `[cwd]`, `[title]`, `[prompts]`,
+`[id]`, or `[agent]` to change what `fzf` searches against. The current
+scope is reflected in the prompt and in the dynamic list label.
+
+### Query History
+
+Search history is persisted at:
+
+```bash
+${XDG_STATE_HOME:-~/.local/state}/fzf-ai/query-history
+```
+
+`fzf-ai` rebinds `ctrl-p` / `ctrl-n` back to list navigation, so query
+history remains available through fzf's alternate history actions only if
+you bind them yourself.
+
+### Footer Summary
+
+The footer is computed asynchronously from the current match set using
+fzf's `{*f}` placeholder. It shows:
+
+* matched session count
+* distinct project count
+* summed message count
+* per-agent counts for the current match set
 
 ## How it fits together
 
 ```
-bin/fzf-ai            ─ bash launcher wiring fzf bindings
-bin/fzf-ai-index      ─ python: walks every session store, emits 8-col TSV
+bin/fzf-ai            ─ bash launcher wiring advanced fzf bindings
+bin/fzf-ai-index      ─ python: walks every session store, emits 9-col TSV
 bin/fzf-ai-preview    ─ python: renders a conversation preview for fzf
 bin/fzf-ai-resume     ─ bash:   cd into cwd and exec the right AI CLI
+bin/fzf-ai-ui         ─ bash:   dynamic labels / scope switching / footer stats
 ```
 
 The index format (TAB-separated):
@@ -108,9 +150,26 @@ The index format (TAB-separated):
                                                edge, used for --nth match
 ```
 
-fzf's `--with-nth=4,5,6,7,8,9` hides columns 1-3 from the list while
-keeping them available to `{1}..{3}` in preview, resume, and execute
-bindings. `--nth=1,4,5,6` (indices into the transformed view) tells fzf
-to fuzzy-match against agent, cwd, title, and the search blob. The blob
-extends off the right edge of the terminal so fzf's default line
-truncation keeps the UI clean while still searching the full text.
+fzf runs with:
+
+```bash
+--with-nth=4,5,6,7,8,9,2
+```
+
+That keeps columns 1-3 hidden from the list while still exposing:
+
+* transformed field `1` = agent
+* transformed field `4` = cwd
+* transformed field `5` = title
+* transformed field `6` = prompt blob
+* transformed field `7` = session id
+
+So `change-nth` can dynamically retarget the search scope without
+rebuilding the list.
+
+## Notes
+
+* The indexer reads JSONL session stores in parallel. Set
+  `FZFAI_INDEX_JOBS=<n>` to override the worker count.
+* The launcher now requires `fzf >= 0.63.0` because it relies on
+  `reload-sync`, footer sections, async transforms, and `{*f}`.

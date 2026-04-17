@@ -7,6 +7,7 @@ window. Works for all agents handled by fzf-ai-index.
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 import os
 import shutil
@@ -38,9 +39,19 @@ BLUE = lambda s: c("34", s)
 ROLE_COLOR = {
     "user": CYAN,
     "assistant": GREEN,
+    "developer": MAGENTA,
     "system": DIM,
     "tool": YELLOW,
 }
+
+NOISE_PREFIXES = (
+    "<permissions instructions>",
+    "<environment_context>",
+    "You are Codex, a coding agent",
+    "You are an AI assistant accessed via an API.",
+    "Filesystem sandboxing defines",
+    "# Escalation Requests",
+)
 
 
 def term_width() -> int:
@@ -89,8 +100,51 @@ def render_message(role: str, text: str, ts: str = "") -> str:
     color = ROLE_COLOR.get(role, lambda s: s)
     tag = f"{role.upper():<9}"
     head = color(BOLD(tag)) + (DIM(f" {ts}") if ts else "")
-    body = wrap(text.strip(), "  ")
+    body = wrap(clean_text(text), "  ")
     return head + "\n" + body
+
+
+def clean_text(text: str) -> str:
+    return "\n".join(line.rstrip() for line in (text or "").strip().splitlines()).strip()
+
+
+def is_noise_message(role: str, text: str) -> bool:
+    text = clean_text(text)
+    if not text:
+        return True
+    if text.startswith("<environment_context>"):
+        return True
+    if role not in {"system", "developer"}:
+        return False
+    if any(text.startswith(prefix) for prefix in NOISE_PREFIXES):
+        return True
+    if "workspace-write" in text and "Filesystem sandboxing" in text:
+        return True
+    return len(text) > 900
+
+
+def summarize_messages(total: int, visible: list[tuple[str, str, str]], model: str) -> str:
+    counts = Counter(role for role, _text, _ts in visible)
+    parts = [f"{total} raw", f"{len(visible)} shown"]
+    for role in ("user", "assistant", "tool", "developer", "system"):
+        if counts.get(role):
+            parts.append(f"{role}={counts[role]}")
+    if model:
+        parts.append(f"model={model}")
+    return "  ·  ".join(parts)
+
+
+def select_excerpt(
+    messages: list[tuple[str, str, str]],
+    max_msgs: int,
+) -> tuple[list[tuple[str, str, str]], int]:
+    if len(messages) <= max_msgs:
+        return messages, 0
+    head_count = min(2, len(messages))
+    tail_count = max(1, max_msgs - head_count)
+    visible = messages[:head_count] + messages[-tail_count:]
+    hidden = max(0, len(messages) - len(visible))
+    return visible, hidden
 
 
 def extract_text(parts):
@@ -164,12 +218,10 @@ def preview_jsonl(
     sid: str,
     max_msgs: int = 20,
 ) -> str:
-    lines = []
     cwd = ""
     total = 0
-    shown = 0
     model = ""
-    messages = []
+    messages: list[tuple[str, str, str]] = []
     if not path.is_file():
         return RED(f"file not found: {path}")
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -238,25 +290,41 @@ def preview_jsonl(
                         messages.append((role, text, fmt_ts(obj.get("timestamp"))))
                         total += 1
 
+    visible_messages = [
+        (role, text, ts)
+        for role, text, ts in messages
+        if not is_noise_message(role, text)
+    ]
+    if not visible_messages:
+        visible_messages = messages
+
+    user_prompts = [
+        clean_text(text)
+        for role, text, _ts in visible_messages
+        if role == "user" and clean_text(text)
+    ]
+    shown_msgs, hidden_count = select_excerpt(visible_messages, max_msgs=max_msgs)
+
     parts = [header(agent, sid, str(path), cwd)]
-    parts.append(
-        DIM(f"{total} messages")
-        + (DIM(f"  model={model}") if model else "")
-    )
+    parts.append(DIM(summarize_messages(total, visible_messages, model)))
+    skipped = total - len(visible_messages)
+    if skipped > 0:
+        parts.append(DIM(f"{skipped} system/developer messages hidden"))
     parts.append("")
-    # Show first few + last few for context
-    head_count = min(3, len(messages))
-    tail_count = min(max_msgs - head_count, len(messages) - head_count)
-    shown_msgs = messages[:head_count]
-    if tail_count > 0 and len(messages) > head_count:
-        if len(messages) - head_count > tail_count:
-            parts.append(
-                DIM(f"    … ({len(messages) - head_count - tail_count} messages hidden) …")
-            )
+
+    if user_prompts:
+        parts.append(BOLD("First Prompt"))
+        parts.append(wrap(user_prompts[0], "  "))
+        if len(user_prompts) > 1 and user_prompts[-1] != user_prompts[0]:
             parts.append("")
-            shown_msgs += messages[-tail_count:]
-        else:
-            shown_msgs += messages[head_count:]
+            parts.append(BOLD("Last User Prompt"))
+            parts.append(wrap(user_prompts[-1], "  "))
+        parts.append("")
+
+    if hidden_count > 0:
+        parts.append(DIM(f"    … ({hidden_count} messages hidden) …"))
+        parts.append("")
+
     for role, text, ts in shown_msgs:
         parts.append(render_message(role, text, ts))
         parts.append("")

@@ -5,10 +5,17 @@
 # re-launch the correct CLI with the correct resume flag.
 set -euo pipefail
 
+print_only=0
+if [[ ${1:-} == "--print-cmd" ]]; then
+  print_only=1
+  shift
+fi
+
 agent=${1:?agent required}
 sid=${2:?session id required}
 source=${3:-}
 cwd=${4:-}
+cwd=${cwd%"${cwd##*[![:space:]]}"}
 
 # Expand "~/…" we emit from the indexer back to $HOME. Use a literal tilde
 # pattern so bash doesn't do its own tilde expansion inside the substitution.
@@ -22,19 +29,35 @@ if [[ -n "$cwd" && -d "$cwd" ]]; then
   cd "$cwd" && cd_ok=1
 fi
 
+print_cmd() {
+  if (( cd_ok )); then
+    printf 'cd %q && ' "$cwd"
+  fi
+  printf '%q ' "$@"
+  printf '\n'
+  exit 0
+}
+
+run_cmd() {
+  if (( print_only )); then
+    print_cmd "$@"
+  fi
+  exec "$@"
+}
+
 case "$agent" in
   claude)
     # claude resumes from cwd; if we couldn't cd, it still works but the
     # session's file references may be wrong.
-    exec claude --resume "$sid"
+    run_cmd claude --resume "$sid"
     ;;
   codex)
     # Pass -C explicitly so codex never prompts to switch directories. When
     # we know the cwd we feed it; otherwise we leave codex to use the pwd.
     if (( cd_ok )); then
-      exec codex resume -C "$cwd" "$sid"
+      run_cmd codex resume -C "$cwd" "$sid"
     else
-      exec codex resume "$sid"
+      run_cmd codex resume "$sid"
     fi
     ;;
   opencode)
@@ -42,21 +65,21 @@ case "$agent" in
     # id via --session. Passing the directory explicitly means we don't
     # even need to cd.
     if [[ -n "$cwd" && -d "$cwd" ]]; then
-      exec opencode "$cwd" --session "$sid"
+      run_cmd opencode "$cwd" --session "$sid"
     else
-      exec opencode --session "$sid"
+      run_cmd opencode --session "$sid"
     fi
     ;;
   droid)
-    exec droid --resume "$sid"
+    run_cmd droid --resume "$sid"
     ;;
   pi)
     # pi supports both: --resume <id> and --session <path>. The path form is
     # the most reliable because pi organises sessions by encoded cwd.
     if [[ -n "$source" && -f "$source" ]]; then
-      exec pi --session "$source"
+      run_cmd pi --session "$source"
     else
-      exec pi --resume "$sid"
+      run_cmd pi --resume "$sid"
     fi
     ;;
   *)

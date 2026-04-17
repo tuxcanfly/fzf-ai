@@ -20,6 +20,7 @@ at the top.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -28,9 +29,13 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 HOME = Path(os.path.expanduser("~"))
+INDEX_JOBS = max(
+    1,
+    int(os.environ.get("FZFAI_INDEX_JOBS") or min(32, (os.cpu_count() or 4) + 4)),
+)
 
 MAX_TITLE = 120
 # Keep the search blob small so that fuzzy matching stays high-signal.
@@ -149,6 +154,35 @@ def iso_to_epoch(s: str) -> float:
         return 0.0
 
 
+def _parallel_read(
+    paths: list[Path],
+    reader: Callable[[Path], Optional[Record]],
+    label: str,
+) -> Iterator[Record]:
+    if not paths:
+        return
+    if len(paths) == 1 or INDEX_JOBS == 1:
+        for path in paths:
+            try:
+                rec = reader(path)
+                if rec:
+                    yield rec
+            except Exception as e:
+                print(f"{label}: {path}: {e}", file=sys.stderr)
+        return
+
+    with ThreadPoolExecutor(max_workers=min(INDEX_JOBS, len(paths))) as pool:
+        futures = {pool.submit(reader, path): path for path in paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                rec = future.result()
+                if rec:
+                    yield rec
+            except Exception as e:
+                print(f"{label}: {path}: {e}", file=sys.stderr)
+
+
 # --------------------------------------------------------------------------
 # Claude Code  -- ~/.claude/projects/<enc-cwd>/<uuid>.jsonl
 # --------------------------------------------------------------------------
@@ -156,16 +190,12 @@ def walk_claude() -> Iterator[Record]:
     root = HOME / ".claude" / "projects"
     if not root.is_dir():
         return
+    paths: list[Path] = []
     for proj in root.iterdir():
         if not proj.is_dir():
             continue
-        for jf in proj.glob("*.jsonl"):
-            try:
-                rec = _read_claude_file(jf)
-                if rec:
-                    yield rec
-            except Exception as e:
-                print(f"claude: {jf}: {e}", file=sys.stderr)
+        paths.extend(proj.glob("*.jsonl"))
+    yield from _parallel_read(paths, _read_claude_file, "claude")
 
 
 def _read_claude_file(path: Path) -> Optional[Record]:
@@ -226,13 +256,8 @@ def walk_codex() -> Iterator[Record]:
     root = HOME / ".codex" / "sessions"
     if not root.is_dir():
         return
-    for jf in root.rglob("rollout-*.jsonl"):
-        try:
-            rec = _read_codex_file(jf)
-            if rec:
-                yield rec
-        except Exception as e:
-            print(f"codex: {jf}: {e}", file=sys.stderr)
+    paths = list(root.rglob("rollout-*.jsonl"))
+    yield from _parallel_read(paths, _read_codex_file, "codex")
 
 
 def _read_codex_file(path: Path) -> Optional[Record]:
@@ -491,16 +516,12 @@ def walk_droid() -> Iterator[Record]:
     root = HOME / ".factory" / "sessions"
     if not root.is_dir():
         return
+    paths: list[Path] = []
     for proj in root.iterdir():
         if not proj.is_dir():
             continue
-        for jf in proj.glob("*.jsonl"):
-            try:
-                rec = _read_droid_file(jf)
-                if rec:
-                    yield rec
-            except Exception as e:
-                print(f"droid: {jf}: {e}", file=sys.stderr)
+        paths.extend(proj.glob("*.jsonl"))
+    yield from _parallel_read(paths, _read_droid_file, "droid")
 
 
 def _read_droid_file(path: Path) -> Optional[Record]:
@@ -560,16 +581,12 @@ def walk_pi() -> Iterator[Record]:
     root = HOME / ".pi" / "agent" / "sessions"
     if not root.is_dir():
         return
+    paths: list[Path] = []
     for proj in root.iterdir():
         if not proj.is_dir():
             continue
-        for jf in proj.glob("*.jsonl"):
-            try:
-                rec = _read_pi_file(jf)
-                if rec:
-                    yield rec
-            except Exception as e:
-                print(f"pi: {jf}: {e}", file=sys.stderr)
+        paths.extend(proj.glob("*.jsonl"))
+    yield from _parallel_read(paths, _read_pi_file, "pi")
 
 
 def _read_pi_file(path: Path) -> Optional[Record]:

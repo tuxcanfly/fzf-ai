@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# fzf-ai-ui: tiny helpers for dynamic fzf labels and scope switching.
+set -euo pipefail
+
+command=${1:-}
+shift || true
+
+scope_spec() {
+  case "${1:-${FZF_NTH:-}}" in
+    ""|"1,4,5,6,7") printf '1,4,5,6,7\n' ;;
+    "1")           printf '1\n' ;;
+    "4")           printf '4\n' ;;
+    "5")           printf '5\n' ;;
+    "6")           printf '6\n' ;;
+    "7")           printf '7\n' ;;
+    *)             printf '%s\n' "${1:-${FZF_NTH:-}}" ;;
+  esac
+}
+
+scope_name() {
+  case "$(scope_spec "${1:-}")" in
+    "1,4,5,6,7") printf 'all\n' ;;
+    "1")         printf 'agent\n' ;;
+    "4")         printf 'cwd\n' ;;
+    "5")         printf 'title\n' ;;
+    "6")         printf 'prompts\n' ;;
+    "7")         printf 'id\n' ;;
+    *)           printf 'custom\n' ;;
+  esac
+}
+
+strip_word() {
+  local word=${1:-}
+  word=${word#[}
+  word=${word%]}
+  printf '%s\n' "$word"
+}
+
+prompt() {
+  printf '%s> ' "$(scope_name)"
+}
+
+list_label() {
+  local scope count suffix
+  scope=$(scope_name)
+  count=${FZF_MATCH_COUNT:-0}
+  suffix=""
+  [[ "$count" != "1" ]] && suffix="es"
+
+  if [[ -n ${FZF_QUERY:-} ]]; then
+    printf ' %s match%s · scope=%s ' "$count" "$suffix" "$scope"
+  else
+    printf ' %s session%s · scope=%s ' "$count" "$suffix" "$scope"
+  fi
+}
+
+footer() {
+  local matches_file=${1:-}
+  if [[ -z "$matches_file" || ! -r "$matches_file" ]]; then
+    printf ' no matching sessions '
+    return 0
+  fi
+
+  awk -F'\t' '
+    BEGIN {
+      split("claude codex opencode droid pi", order, " ")
+    }
+    {
+      sessions++
+      agents[$1]++
+      msgs += ($6 + 0)
+      if (!seen_cwd[$7]++) {
+        projects++
+      }
+    }
+    END {
+      printf " %d session%s · %d project%s · %d msg%s",
+        sessions, (sessions == 1 ? "" : "s"),
+        projects, (projects == 1 ? "" : "s"),
+        msgs, (msgs == 1 ? "" : "s")
+      for (i = 1; i <= length(order); i++) {
+        agent = order[i]
+        if (agents[agent] > 0) {
+          printf " · %s %d", agent, agents[agent]
+        }
+      }
+      printf " "
+    }
+  ' "$matches_file"
+}
+
+preview_label() {
+  local agent=${1:-} sid=${2:-} title=${3:-}
+  title=${title//$'\t'/ }
+  title=${title//$'\n'/ }
+  title=$(printf '%s' "$title" | sed 's/[[:space:]]\+/ /g')
+  [[ ${#sid} -gt 8 ]] && sid=${sid:0:8}
+  [[ ${#title} -gt 72 ]] && title="${title:0:69}..."
+
+  if [[ -n "$title" && "$title" != "(no title)" ]]; then
+    printf ' %s · %s · %s ' "$agent" "$sid" "$title"
+  else
+    printf ' %s · %s ' "$agent" "$sid"
+  fi
+}
+
+click_header_action() {
+  local word
+  word=$(strip_word "${FZF_CLICK_HEADER_WORD:-}")
+  case "$word" in
+    all)     printf 'change-nth(1,4,5,6,7)\n' ;;
+    agent)   printf 'change-nth(1)\n' ;;
+    cwd)     printf 'change-nth(4)\n' ;;
+    title)   printf 'change-nth(5)\n' ;;
+    prompts) printf 'change-nth(6)\n' ;;
+    id)      printf 'change-nth(7)\n' ;;
+    *)       exit 0 ;;
+  esac
+}
+
+cycle_scope_action() {
+  case "$(scope_spec)" in
+    "1,4,5,6,7") printf 'change-nth(4)\n' ;;
+    "4")         printf 'change-nth(5)\n' ;;
+    "5")         printf 'change-nth(6)\n' ;;
+    "6")         printf 'change-nth(7)\n' ;;
+    "7")         printf 'change-nth(1)\n' ;;
+    *)           printf 'change-nth(1,4,5,6,7)\n' ;;
+  esac
+}
+
+case "$command" in
+  prompt) prompt ;;
+  list-label) list_label ;;
+  footer) footer "$@" ;;
+  preview-label) preview_label "$@" ;;
+  click-header-action) click_header_action ;;
+  cycle-scope-action) cycle_scope_action ;;
+  *)
+    echo "usage: $0 prompt|list-label|footer|preview-label|click-header-action|cycle-scope-action" >&2
+    exit 2
+    ;;
+esac

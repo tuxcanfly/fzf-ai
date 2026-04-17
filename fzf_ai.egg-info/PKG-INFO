@@ -65,7 +65,8 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
   (first real prompt, last user prompt, recent replies, tool calls,
   reasoning, model, cwd). Boilerplate environment / policy blocks are
   hidden from the preview when possible.
-* **Exact-match by default** across agent / cwd / title / user prompts.
+* **Exact-match by default** across agent / cwd / title / hidden session
+  content snippets.
   fzf runs with `--exact`, so typing `noita` finds sessions containing
   `noita`. Use `'word` to fall back to fuzzy for a single term, `!word`
   to exclude, `^word` / `word$` for prefix / suffix.
@@ -164,7 +165,7 @@ fzf-ai claude codex       # only these agents
 | `ctrl-p`       | move up                                            |
 | `ctrl-n`       | move down                                          |
 | `ctrl-r`       | rebuild the index in place                         |
-| `ctrl-s`       | cycle search scope: `all → cwd → title → prompts → id → agent` |
+| `ctrl-s`       | cycle search scope: `all → cwd → title → content → agent` |
 | `?`            | toggle preview pane                                |
 | `alt-p`        | cycle preview position / hide preview              |
 | `alt-1..5`     | filter to claude / codex / opencode / droid / pi   |
@@ -172,8 +173,8 @@ fzf-ai claude codex       # only these agents
 
 ### Scope Switching
 
-The header is clickable. Click `[all]`, `[cwd]`, `[title]`, `[prompts]`,
-`[id]`, or `[agent]` to change what `fzf` searches against. The current
+The header is clickable. Click `[all]`, `[cwd]`, `[title]`, `[content]`,
+or `[agent]` to change what `fzf` searches against. The current
 scope is reflected in the prompt and in the dynamic list label.
 
 ### Query History
@@ -214,14 +215,14 @@ The index format (TAB-separated):
 1 agent(raw)   2 session_id   3 source      ← hidden, machine only
 4 agent(ui)    5 updated      6 msgs        ← visible, padded + ANSI
 7 cwd          8 title                       ← visible
-9 search blob (concat of all user prompts)  ← visible but past the right
-                                               edge, used for --nth match
+9 search blob (hidden session content)      ← pushed past the right edge,
+                                               used for content search only
 ```
 
 fzf runs with:
 
 ```bash
---with-nth=4,5,6,7,8,9,2
+--with-nth=4,5,6,7,8,9
 ```
 
 That keeps columns 1-3 hidden from the list while still exposing:
@@ -229,8 +230,7 @@ That keeps columns 1-3 hidden from the list while still exposing:
 * transformed field `1` = agent
 * transformed field `4` = cwd
 * transformed field `5` = title
-* transformed field `6` = prompt blob
-* transformed field `7` = session id
+* transformed field `6` = hidden content blob
 
 So `change-nth` can dynamically retarget the search scope without
 rebuilding the list.

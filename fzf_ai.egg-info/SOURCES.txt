@@ -1,0 +1,16 @@
+LICENSE
+MANIFEST.in
+Makefile
+README.md
+setup.py
+bin/fzf-ai
+bin/fzf-ai-index
+bin/fzf-ai-preview
+bin/fzf-ai-resume
+bin/fzf-ai-ui
+bin/version.py
+fzf_ai.egg-info/PKG-INFO
+fzf_ai.egg-info/SOURCES.txt
+fzf_ai.egg-info/dependency_links.txt
+fzf_ai.egg-info/not-zip-safe
+fzf_ai.egg-info/top_level.txt

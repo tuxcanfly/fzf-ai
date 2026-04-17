@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+include Makefile
+include bin/*
+recursive-include bin *.py
+recursive-exclude bin __pycache__
+recursive-exclude bin *.pyc

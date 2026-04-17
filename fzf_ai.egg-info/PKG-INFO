@@ -1,3 +1,39 @@
+Metadata-Version: 2.4
+Name: fzf-ai
+Version: 1.0.0
+Summary: Fuzzy-find and resume any AI coding session across multiple AI assistants
+Home-page: https://github.com/yourusername/fzf-ai
+Author: fzf-ai contributors
+Author-email: 
+License: MIT
+Keywords: fzf ai coding assistant claude codex opencode droid pi
+Classifier: Development Status :: 4 - Beta
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.7
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Software Development :: Code Generators
+Classifier: Topic :: Text Processing :: Filters
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: author
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-python
+Dynamic: summary
+
 # fzf-ai
 
 Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
@@ -62,9 +98,6 @@ pip install fzf_ai-1.0.0.tar.gz
 pip install fzf-ai
 ```
 
-The pip installation will automatically add the scripts to your PATH if you have
-the Python bin directory in your PATH (typically `~/.local/bin` or `~/Library/Python/3.x/bin`).
-
 ### Option 2: Using Make (traditional method)
 ```bash
 # Clone or download the repository
@@ -72,17 +105,6 @@ cd fzf-ai
 make install-symlink
 # Make sure ~/.local/bin is in your PATH
 export PATH="$HOME/.local/bin:$PATH"
-```
-
-### Option 3: Manual installation
-```bash
-# Add the bin directory to your PATH
-export PATH="$PWD/bin:$PATH"
-# Or create symlinks to a directory in your PATH
-ln -s "$PWD/bin/fzf-ai"          ~/.local/bin/fzf-ai
-ln -s "$PWD/bin/fzf-ai-index"    ~/.local/bin/fzf-ai-index
-ln -s "$PWD/bin/fzf-ai-preview"  ~/.local/bin/fzf-ai-preview
-ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 ```
 
 ### Option 3: Manual installation

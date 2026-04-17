@@ -103,6 +103,9 @@ resume on your `$PATH`.
 GitHub Actions trusted publishing is configured in
 `.github/workflows/pypi-publish.yml`.
 
+Regular validation for pushes and pull requests runs in
+`.github/workflows/ci.yml`.
+
 To enable it on PyPI, add a Trusted Publisher for project `fzf-ai` with:
 
 * owner: `tuxcanfly`

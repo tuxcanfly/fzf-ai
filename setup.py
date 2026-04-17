@@ -24,10 +24,10 @@ setup(
     description="Fuzzy-find and resume any AI coding session across multiple AI assistants",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
-    author="fzf-ai contributors",
+    author="tuxcanfly",
     author_email="",
-    url="https://github.com/yourusername/fzf-ai",  # Update this if it's on GitHub
-    license="MIT",  # Update if you want a different license
+    url="https://github.com/tuxcanfly/fzf-ai",
+    license="MIT",
     packages=[],  # We're installing scripts directly, not Python packages
     include_package_data=True,
     python_requires=">=3.7",
@@ -51,6 +51,11 @@ setup(
         "Topic :: Text Processing :: Filters",
     ],
     keywords="fzf ai coding assistant claude codex opencode droid pi",
+    project_urls={
+        "Homepage": "https://github.com/tuxcanfly/fzf-ai",
+        "Repository": "https://github.com/tuxcanfly/fzf-ai",
+        "Issues": "https://github.com/tuxcanfly/fzf-ai/issues",
+    },
     data_files=[
         # Include the bin scripts
         ('bin', [

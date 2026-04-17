@@ -2,10 +2,13 @@ Metadata-Version: 2.4
 Name: fzf-ai
 Version: 1.0.0
 Summary: Fuzzy-find and resume any AI coding session across multiple AI assistants
-Home-page: https://github.com/yourusername/fzf-ai
-Author: fzf-ai contributors
+Home-page: https://github.com/tuxcanfly/fzf-ai
+Author: tuxcanfly
 Author-email: 
 License: MIT
+Project-URL: Homepage, https://github.com/tuxcanfly/fzf-ai
+Project-URL: Repository, https://github.com/tuxcanfly/fzf-ai
+Project-URL: Issues, https://github.com/tuxcanfly/fzf-ai/issues
 Keywords: fzf ai coding assistant claude codex opencode droid pi
 Classifier: Development Status :: 4 - Beta
 Classifier: Environment :: Console
@@ -31,6 +34,7 @@ Dynamic: home-page
 Dynamic: keywords
 Dynamic: license
 Dynamic: license-file
+Dynamic: project-url
 Dynamic: requires-python
 Dynamic: summary
 
@@ -133,6 +137,31 @@ ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 
 Requires: `fzf` ≥ 0.63, `python3` (stdlib only), each AI CLI you want to
 resume on your `$PATH`.
+
+## PyPI Publishing
+
+GitHub Actions trusted publishing is configured in
+`.github/workflows/pypi-publish.yml`.
+
+To enable it on PyPI, add a Trusted Publisher for project `fzf-ai` with:
+
+* owner: `tuxcanfly`
+* repository: `fzf-ai`
+* workflow: `.github/workflows/pypi-publish.yml`
+* environment: `pypi`
+
+If `fzf-ai` does not exist on PyPI yet, create a pending publisher under
+your PyPI account with the same values.
+
+Publishing flow:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow will build the sdist/wheel, run `twine check`, and publish to
+PyPI using GitHub OIDC instead of a long-lived API token.
 
 ## Usage
 

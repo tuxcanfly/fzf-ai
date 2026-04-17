@@ -98,6 +98,31 @@ ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 Requires: `fzf` ≥ 0.63, `python3` (stdlib only), each AI CLI you want to
 resume on your `$PATH`.
 
+## PyPI Publishing
+
+GitHub Actions trusted publishing is configured in
+`.github/workflows/pypi-publish.yml`.
+
+To enable it on PyPI, add a Trusted Publisher for project `fzf-ai` with:
+
+* owner: `tuxcanfly`
+* repository: `fzf-ai`
+* workflow: `.github/workflows/pypi-publish.yml`
+* environment: `pypi`
+
+If `fzf-ai` does not exist on PyPI yet, create a pending publisher under
+your PyPI account with the same values.
+
+Publishing flow:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+The workflow will build the sdist/wheel, run `twine check`, and publish to
+PyPI using GitHub OIDC instead of a long-lived API token.
+
 ## Usage
 
 ```bash

@@ -2,6 +2,7 @@ LICENSE
 MANIFEST.in
 Makefile
 README.md
+pyproject.toml
 setup.py
 bin/fzf-ai
 bin/fzf-ai-index

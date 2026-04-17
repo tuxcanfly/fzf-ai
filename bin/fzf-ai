@@ -56,11 +56,11 @@ fi
 #   1 agent-raw   2 session_id  3 source        (hidden, machine-only)
 #   4 agent-badge 5 updated     6 msgs          (visible, padded)
 #   7 cwd         8 title                       (visible)
-#   9 search-blob (rendered but off-screen)     -- concat of user prompts
+#   9 search-blob (rendered but off-screen)     -- hidden session content
 # fzf's --nth indexes into the --with-nth view, so the visible columns
-# are: 4,5,6,7,8,9,2 = positions 1,2,3,4,5,6,7 in the transformed view.
-# Position 7 is the hidden session id, which lets us retarget search to ids
-# with change-nth without redrawing the list.
+# are: 4,5,6,7,8,9 = positions 1,2,3,4,5,6 in the transformed view.
+# Column 9 is deliberately pushed off-screen so session content is searchable
+# without cluttering the list rows.
 # --------------------------------------------------------------------------
 
 copy_cmd() {
@@ -101,7 +101,7 @@ export FZFAI_COPY="$COPY"
 
 # Preview command: index record passed via positional expansion.
 #   {1}=agent {2}=sid {3}=source {7}=cwd {8}=title
-PREVIEW_CMD='"$FZFAI_PREVIEW" {1} {2} {3}'
+PREVIEW_CMD='"$FZFAI_PREVIEW" {1} {2} {3} {q}'
 
 # Reload command re-runs the indexer, optionally filtered to named agents.
 RELOAD_CMD=$(quote_cmd "$FZFAI_INDEX" "${AGENTS[@]}")
@@ -111,7 +111,7 @@ RELOAD_OPENCODE_CMD=$(quote_cmd "$FZFAI_INDEX" opencode)
 RELOAD_DROID_CMD=$(quote_cmd "$FZFAI_INDEX" droid)
 RELOAD_PI_CMD=$(quote_cmd "$FZFAI_INDEX" pi)
 
-HEADER=$'scope: [all] [agent] [cwd] [title] [prompts] [id]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-1..5: agent'
+HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-1..5: agent'
 if [[ -n "$COPY" ]]; then
   HEADER+=$'  ·  ctrl-y: copy id  ·  ctrl-k: copy cmd'
 fi
@@ -127,8 +127,8 @@ fi
 FZF_ARGS=(
   --ansi
   --delimiter=$'\t'
-  --with-nth='4,5,6,7,8,9,2'
-  --nth='1,4,5,6,7'
+  --with-nth='4,5,6,7,8,9'
+  --nth='1,4,5,6'
   --scheme=default
   --exact
   --no-sort
@@ -137,6 +137,7 @@ FZF_ARGS=(
   --info=inline-right
   --highlight-line
   --filepath-word
+  --no-hscroll
   --history="$HISTORY_FILE"
   --height=100%
   --tmux='90%,90%'

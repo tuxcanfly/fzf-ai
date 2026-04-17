@@ -38,13 +38,15 @@ INDEX_JOBS = max(
 )
 
 MAX_TITLE = 120
+DISPLAY_CWD = 28
+DISPLAY_TITLE = 72
 # Keep the search blob small so that fuzzy matching stays high-signal.
 # Long soups of text are easy to accidentally match against, which floods
 # the picker with irrelevant rows whenever the query shares common letters
 # with filler content. 1200 chars is enough to hold ~10 distinctive prompt
 # openings per session.
 MAX_SEARCH_BLOB = 4000
-MAX_SEARCH_PROMPT = 140  # first part of each prompt only
+MAX_SEARCH_CHUNK = 140  # first part of each message only
 
 # Colors for the agent tag in the main list (fzf with --ansi renders these).
 _AGENT_COLOR = {
@@ -56,6 +58,10 @@ _AGENT_COLOR = {
 }
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
+_SEARCH_NOISE_PREFIXES = (
+    "<environment_context>",
+    "<permissions instructions>",
+)
 
 
 def colorise(agent: str) -> str:
@@ -74,15 +80,20 @@ class Record:
     msgs: int = 0
     cwd: str = ""
     title: str = ""
-    # user prompts joined with " · " for fuzzy search (hidden column)
+    # message snippets joined with " · " for fuzzy search (hidden column)
     prompts: list = field(default_factory=list)
+
+    def add_search_text(self, text: str) -> None:
+        t = clean(text)[:MAX_SEARCH_CHUNK]
+        if any(t.startswith(prefix) for prefix in _SEARCH_NOISE_PREFIXES):
+            return
+        if t and t not in self.prompts:
+            self.prompts.append(t)
 
     def add_prompt(self, text: str) -> None:
         if not is_real_prompt(text):
             return
-        t = clean(text)[:MAX_SEARCH_PROMPT]
-        if t and t not in self.prompts:
-            self.prompts.append(t)
+        self.add_search_text(text)
 
     def as_row(self) -> str:
         iso = (
@@ -91,11 +102,12 @@ class Record:
             if self.updated
             else ""
         )
-        title = clean(self.title)[:MAX_TITLE] or "(no title)"
+        title = display_text(clean(self.title)[:MAX_TITLE] or "(no title)", DISPLAY_TITLE)
         cwd = self.cwd or ""
         # short cwd: replace $HOME with ~ for display compactness
         if cwd.startswith(str(HOME)):
             cwd = "~" + cwd[len(str(HOME)) :]
+        cwd = display_text(cwd, DISPLAY_CWD)
         # Build search blob: strip TABs/newlines, cap total size.
         blob = " · ".join(self.prompts)
         blob = blob.replace("\t", " ").replace("\n", " ")[:MAX_SEARCH_BLOB]
@@ -109,7 +121,7 @@ class Record:
                 colorise(self.agent),           # 4  agent badge (visible)
                 f"{iso:<16}",                   # 5  date
                 f"{self.msgs:>4}",              # 6  msgs
-                f"{cwd:<40}",                   # 7  cwd
+                f"{cwd:<{DISPLAY_CWD}}",        # 7  cwd
                 title,                          # 8  title
                 blob,                           # 9  search blob (hidden)
             ]
@@ -121,6 +133,34 @@ def clean(s: str) -> str:
         return ""
     s = re.sub(r"\s+", " ", s)
     return s.strip()
+
+
+def display_text(text: str, width: int) -> str:
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def iter_text_fragments(parts) -> Iterator[str]:
+    if parts is None:
+        return
+    if isinstance(parts, str):
+        yield parts
+        return
+    if not isinstance(parts, list):
+        return
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in ("text", "input_text", "output_text"):
+            text = part.get("text")
+            if text is None:
+                text = (part.get("data") or {}).get("text")
+            if text:
+                yield text
 
 
 _JUNK_PREFIXES = (
@@ -222,22 +262,15 @@ def _read_claude_file(path: Path) -> Optional[Record]:
                 msgs += 1
             if not cwd and obj.get("cwd"):
                 cwd = obj["cwd"]
-            if obj.get("type") == "user" and not obj.get("isMeta"):
+            if obj.get("type") in ("user", "assistant") and not obj.get("isMeta"):
                 m = obj.get("message") or {}
-                content = m.get("content")
-                if isinstance(content, str):
-                    if is_real_prompt(content):
+                for tx in iter_text_fragments(m.get("content")):
+                    if obj.get("type") == "user" and is_real_prompt(tx):
                         if not title:
-                            title = content
-                        rec.add_prompt(content)
-                elif isinstance(content, list):
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            tx = p.get("text", "")
-                            if is_real_prompt(tx):
-                                if not title:
-                                    title = tx
-                                rec.add_prompt(tx)
+                            title = tx
+                        rec.add_prompt(tx)
+                    else:
+                        rec.add_search_text(tx)
             ts = obj.get("timestamp")
             if ts:
                 e = iso_to_epoch(ts)
@@ -296,17 +329,14 @@ def _read_codex_file(path: Path) -> Optional[Record]:
                 role = payload.get("role")
                 if role in ("user", "assistant"):
                     msgs += 1
-                if role == "user":
-                    for c in payload.get("content", []) or []:
-                        if isinstance(c, dict) and c.get("type") in (
-                            "input_text",
-                            "text",
-                        ):
-                            tx = c.get("text", "")
-                            if is_real_prompt(tx):
-                                if not title:
-                                    title = tx
-                                rec.add_prompt(tx)
+                if role in ("user", "assistant"):
+                    for tx in iter_text_fragments(payload.get("content", []) or []):
+                        if role == "user" and is_real_prompt(tx):
+                            if not title:
+                                title = tx
+                            rec.add_prompt(tx)
+                        else:
+                            rec.add_search_text(tx)
             ts = obj.get("timestamp")
             if ts:
                 e = iso_to_epoch(ts)
@@ -384,23 +414,25 @@ def _opencode_walk_current(con: sqlite3.Connection, db: Path) -> Iterator[Record
     ):
         msg_count[sid] = c
 
-    # User-prompt text extracted in SQL. json_extract returns the string
-    # value of $.text. The LIKE pre-filter keeps the scan narrow.
-    user_prompts: dict[str, list[str]] = {}
-    for sid, text in con.execute(
+    # Search text extracted in SQL. We keep the title derived from real user
+    # prompts but also index assistant text so queries can match session
+    # content without showing it in the main list rows.
+    search_text: dict[str, list[tuple[str, str]]] = {}
+    for sid, role, text in con.execute(
         """
-        SELECT p.session_id, json_extract(p.data, '$.text') AS txt
+        SELECT p.session_id,
+               json_extract(m.data, '$.role') AS role,
+               json_extract(p.data, '$.text') AS txt
         FROM part p
         JOIN message m ON p.message_id = m.id
         WHERE p.data LIKE '{"type":"text"%'
-          AND m.data LIKE '%"role":"user"%'
           AND (json_extract(p.data, '$.synthetic') IS NULL
                OR json_extract(p.data, '$.synthetic') = 0)
         ORDER BY p.time_created ASC
         """
     ):
-        if text and is_real_prompt(text):
-            user_prompts.setdefault(sid, []).append(text)
+        if text and role in ("user", "assistant"):
+            search_text.setdefault(sid, []).append((role, text))
 
     for sid, directory, title, updated in sessions:
         rec = Record(
@@ -411,11 +443,13 @@ def _opencode_walk_current(con: sqlite3.Connection, db: Path) -> Iterator[Record
             msgs=msg_count.get(sid, 0),
             cwd=directory or "",
         )
-        prompts = user_prompts.get(sid, [])
-        if prompts:
-            rec.title = prompts[0]
-            for p in prompts:
-                rec.add_prompt(p)
+        for role, text in search_text.get(sid, []):
+            if role == "user" and is_real_prompt(text):
+                if not rec.title:
+                    rec.title = text
+                rec.add_prompt(text)
+            else:
+                rec.add_search_text(text)
         if not rec.title:
             rec.title = title or ""
         yield rec
@@ -429,9 +463,9 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
     rows = cur.fetchall()
     if not rows:
         return
-    user_prompts: dict[str, list[str]] = {}
-    for sid, parts in con.execute(
-        "SELECT session_id, parts FROM messages WHERE role='user' ORDER BY created_at ASC"
+    search_text: dict[str, list[tuple[str, str]]] = {}
+    for sid, role, parts in con.execute(
+        "SELECT session_id, role, parts FROM messages ORDER BY created_at ASC"
     ):
         try:
             p = json.loads(parts)
@@ -445,9 +479,8 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
             tx = part.get("text") or (
                 (part.get("data") or {}).get("text")
             ) or ""
-            if is_real_prompt(tx):
-                user_prompts.setdefault(sid, []).append(tx)
-                break
+            if tx:
+                search_text.setdefault(sid, []).append((role, tx))
     # cwd via files table (best-effort)
     cwd_map: dict[str, str] = {}
     try:
@@ -473,10 +506,13 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
             cwd=cwd_map.get(sid, ""),
             title="",
         )
-        for p in user_prompts.get(sid, []):
-            if not rec.title:
-                rec.title = p
-            rec.add_prompt(p)
+        for role, text in search_text.get(sid, []):
+            if role == "user" and is_real_prompt(text):
+                if not rec.title:
+                    rec.title = text
+                rec.add_prompt(text)
+            else:
+                rec.add_search_text(text)
         if not rec.title:
             rec.title = title or ""
         yield rec
@@ -555,14 +591,14 @@ def _read_droid_file(path: Path) -> Optional[Record]:
                 role = m.get("role")
                 if role in ("user", "assistant"):
                     msgs += 1
-                if role == "user":
-                    for p in m.get("content") or []:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            tx = p.get("text", "")
-                            if is_real_prompt(tx):
-                                if not title:
-                                    title = tx
-                                rec.add_prompt(tx)
+                if role in ("user", "assistant"):
+                    for tx in iter_text_fragments(m.get("content") or []):
+                        if role == "user" and is_real_prompt(tx):
+                            if not title:
+                                title = tx
+                            rec.add_prompt(tx)
+                        else:
+                            rec.add_search_text(tx)
             ts = obj.get("timestamp")
             if ts:
                 e = iso_to_epoch(ts)
@@ -625,21 +661,14 @@ def _read_pi_file(path: Path) -> Optional[Record]:
                 role = m.get("role")
                 if role in ("user", "assistant"):
                     msgs += 1
-                if role == "user":
-                    content = m.get("content")
-                    if isinstance(content, list):
-                        for p in content:
-                            if isinstance(p, dict) and p.get("type") == "text":
-                                tx = p.get("text", "")
-                                if is_real_prompt(tx):
-                                    if not title:
-                                        title = tx
-                                    rec.add_prompt(tx)
-                    elif isinstance(content, str):
-                        if is_real_prompt(content):
+                if role in ("user", "assistant"):
+                    for tx in iter_text_fragments(m.get("content")):
+                        if role == "user" and is_real_prompt(tx):
                             if not title:
-                                title = content
-                            rec.add_prompt(content)
+                                title = tx
+                            rec.add_prompt(tx)
+                        else:
+                            rec.add_search_text(tx)
             ts = obj.get("timestamp")
             if ts:
                 e = iso_to_epoch(ts)

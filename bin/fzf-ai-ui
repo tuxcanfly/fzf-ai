@@ -7,24 +7,22 @@ shift || true
 
 scope_spec() {
   case "${1:-${FZF_NTH:-}}" in
-    ""|"1,4,5,6,7") printf '1,4,5,6,7\n' ;;
+    ""|"1,4,5,6") printf '1,4,5,6\n' ;;
     "1")           printf '1\n' ;;
     "4")           printf '4\n' ;;
     "5")           printf '5\n' ;;
     "6")           printf '6\n' ;;
-    "7")           printf '7\n' ;;
     *)             printf '%s\n' "${1:-${FZF_NTH:-}}" ;;
   esac
 }
 
 scope_name() {
   case "$(scope_spec "${1:-}")" in
-    "1,4,5,6,7") printf 'all\n' ;;
+    "1,4,5,6") printf 'all\n' ;;
     "1")         printf 'agent\n' ;;
     "4")         printf 'cwd\n' ;;
     "5")         printf 'title\n' ;;
-    "6")         printf 'prompts\n' ;;
-    "7")         printf 'id\n' ;;
+    "6")         printf 'content\n' ;;
     *)           printf 'custom\n' ;;
   esac
 }
@@ -108,24 +106,22 @@ click_header_action() {
   local word
   word=$(strip_word "${FZF_CLICK_HEADER_WORD:-}")
   case "$word" in
-    all)     printf 'change-nth(1,4,5,6,7)\n' ;;
+    all)     printf 'change-nth(1,4,5,6)\n' ;;
     agent)   printf 'change-nth(1)\n' ;;
     cwd)     printf 'change-nth(4)\n' ;;
     title)   printf 'change-nth(5)\n' ;;
-    prompts) printf 'change-nth(6)\n' ;;
-    id)      printf 'change-nth(7)\n' ;;
+    content) printf 'change-nth(6)\n' ;;
     *)       exit 0 ;;
   esac
 }
 
 cycle_scope_action() {
   case "$(scope_spec)" in
-    "1,4,5,6,7") printf 'change-nth(4)\n' ;;
+    "1,4,5,6") printf 'change-nth(4)\n' ;;
     "4")         printf 'change-nth(5)\n' ;;
     "5")         printf 'change-nth(6)\n' ;;
-    "6")         printf 'change-nth(7)\n' ;;
-    "7")         printf 'change-nth(1)\n' ;;
-    *)           printf 'change-nth(1,4,5,6,7)\n' ;;
+    "6")         printf 'change-nth(1)\n' ;;
+    *)           printf 'change-nth(1,4,5,6)\n' ;;
   esac
 }
 

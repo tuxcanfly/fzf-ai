@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -53,6 +54,14 @@ NOISE_PREFIXES = (
     "# Escalation Requests",
 )
 
+MESSAGE_CLIP = {
+    "user": (5, 420),
+    "assistant": (8, 900),
+    "tool": (6, 700),
+    "developer": (4, 260),
+    "system": (4, 260),
+}
+
 
 def term_width() -> int:
     try:
@@ -85,27 +94,101 @@ def wrap(text: str, indent: str = "  ") -> str:
     return "\n".join(out)
 
 
+def home_rel(path: str) -> str:
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def compact_path(path: str, keep: int = 2) -> str:
+    if path.startswith("sqlite:"):
+        return "sqlite:" + compact_path(path[len("sqlite:"):], keep=keep)
+    path = home_rel(path)
+    parts = [p for p in path.split("/") if p]
+    prefix = "~/" if path.startswith("~/") else "/" if path.startswith("/") else ""
+    if len(parts) <= keep:
+        return path
+    return prefix + "…/" + "/".join(parts[-keep:])
+
+
+def short_sid(sid: str) -> str:
+    return sid if len(sid) <= 8 else sid[:8]
+
+
 def header(agent: str, sid: str, source: str, cwd: str = "") -> str:
     lines = [
-        BOLD(f"{agent}") + DIM(f"  {sid}"),
+        BOLD(agent) + DIM(f"  sid:{short_sid(sid)}"),
     ]
     if cwd:
-        lines.append(DIM("cwd  ") + cwd)
-    lines.append(DIM("src  ") + source)
+        lines.append(DIM("cwd  ") + compact_path(cwd, keep=3))
+    lines.append(DIM("src  ") + compact_path(source, keep=2))
     lines.append(DIM("─" * term_width()))
     return "\n".join(lines)
 
 
-def render_message(role: str, text: str, ts: str = "") -> str:
+def render_message(role: str, text: str, ts: str = "", terms: list[str] | None = None) -> str:
     color = ROLE_COLOR.get(role, lambda s: s)
     tag = f"{role.upper():<9}"
     head = color(BOLD(tag)) + (DIM(f" {ts}") if ts else "")
-    body = wrap(clean_text(text), "  ")
+    body = wrap(clip_text(clean_text(text), role=role), "  ")
+    body = highlight_terms(body, terms or [])
     return head + "\n" + body
 
 
 def clean_text(text: str) -> str:
     return "\n".join(line.rstrip() for line in (text or "").strip().splitlines()).strip()
+
+
+def clip_text(text: str, role: str = "assistant", max_lines: int | None = None, max_chars: int | None = None) -> str:
+    text = clean_text(text)
+    default_lines, default_chars = MESSAGE_CLIP.get(role, (6, 500))
+    max_lines = default_lines if max_lines is None else max_lines
+    max_chars = default_chars if max_chars is None else max_chars
+    if not text:
+        return text
+
+    clipped = text[:max_chars].rstrip()
+    char_truncated = len(clipped) < len(text)
+    lines = clipped.splitlines()
+    line_truncated = len(lines) > max_lines
+    if line_truncated:
+        clipped = "\n".join(lines[:max_lines]).rstrip()
+    if char_truncated or line_truncated:
+        clipped = clipped.rstrip(" .") + " …"
+    return clipped
+
+
+def query_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    for raw in query.split():
+        token = raw.strip()
+        if not token or token == "|":
+            continue
+        token = token.lstrip("!'^")
+        token = token.rstrip("$")
+        if token:
+            terms.append(token.lower())
+    return sorted(set(terms), key=len, reverse=True)
+
+
+def message_matches(text: str, terms: list[str]) -> bool:
+    haystack = clean_text(text).lower()
+    return any(term in haystack for term in terms)
+
+
+def highlight_terms(text: str, terms: list[str]) -> str:
+    if NO_COLOR or not terms:
+        return text
+    out = text
+    for term in terms:
+        out = re.sub(
+            re.escape(term),
+            lambda m: c("30;43", m.group(0)),
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
 
 
 def is_noise_message(role: str, text: str) -> bool:
@@ -134,6 +217,10 @@ def summarize_messages(total: int, visible: list[tuple[str, str, str]], model: s
     return "  ·  ".join(parts)
 
 
+def same_message(a: str, b: str) -> bool:
+    return clean_text(a) == clean_text(b)
+
+
 def select_excerpt(
     messages: list[tuple[str, str, str]],
     max_msgs: int,
@@ -145,6 +232,31 @@ def select_excerpt(
     visible = messages[:head_count] + messages[-tail_count:]
     hidden = max(0, len(messages) - len(visible))
     return visible, hidden
+
+
+def select_match_excerpt(
+    messages: list[tuple[str, str, str]],
+    terms: list[str],
+    max_msgs: int,
+) -> tuple[list[tuple[str, str, str]], int, list[int]]:
+    matched = [i for i, (_role, text, _ts) in enumerate(messages) if message_matches(text, terms)]
+    if not matched:
+        visible, hidden = select_excerpt(messages, max_msgs)
+        return visible, hidden, matched
+
+    keep: list[int] = []
+    seen: set[int] = set()
+    for idx in matched:
+        for pos in range(max(0, idx - 1), min(len(messages), idx + 2)):
+            if pos not in seen:
+                seen.add(pos)
+                keep.append(pos)
+        if len(keep) >= max_msgs:
+            break
+    keep = keep[:max_msgs]
+    visible = [messages[i] for i in keep]
+    hidden = max(0, len(messages) - len(visible))
+    return visible, hidden, matched
 
 
 def extract_text(parts):
@@ -216,6 +328,7 @@ def preview_jsonl(
     path: Path,
     agent: str,
     sid: str,
+    query: str = "",
     max_msgs: int = 20,
 ) -> str:
     cwd = ""
@@ -303,7 +416,18 @@ def preview_jsonl(
         for role, text, _ts in visible_messages
         if role == "user" and clean_text(text)
     ]
-    shown_msgs, hidden_count = select_excerpt(visible_messages, max_msgs=max_msgs)
+    terms = query_terms(query)
+    shown_msgs, hidden_count, matched_indices = select_match_excerpt(
+        visible_messages,
+        terms=terms,
+        max_msgs=max_msgs,
+    )
+    first_prompt = user_prompts[0] if user_prompts else ""
+    last_prompt = user_prompts[-1] if user_prompts else ""
+    if not matched_indices and shown_msgs and first_prompt and shown_msgs[0][0] == "user" and same_message(shown_msgs[0][1], first_prompt):
+        shown_msgs = shown_msgs[1:]
+    if not matched_indices and shown_msgs and len(user_prompts) > 1 and shown_msgs[-1][0] == "user" and same_message(shown_msgs[-1][1], last_prompt):
+        shown_msgs = shown_msgs[:-1]
 
     parts = [header(agent, sid, str(path), cwd)]
     parts.append(DIM(summarize_messages(total, visible_messages, model)))
@@ -312,13 +436,24 @@ def preview_jsonl(
         parts.append(DIM(f"{skipped} system/developer messages hidden"))
     parts.append("")
 
-    if user_prompts:
+    if terms and matched_indices:
+        parts.append(BOLD(f"Query Matches ({len(matched_indices)})"))
+        for idx in matched_indices[:2]:
+            role, text, _ts = visible_messages[idx]
+            parts.append(
+                wrap(
+                    highlight_terms(clip_text(text, role=role, max_lines=2, max_chars=180), terms),
+                    "  ",
+                )
+            )
+            parts.append("")
+    elif user_prompts:
         parts.append(BOLD("First Prompt"))
-        parts.append(wrap(user_prompts[0], "  "))
-        if len(user_prompts) > 1 and user_prompts[-1] != user_prompts[0]:
+        parts.append(wrap(clip_text(first_prompt, role="user", max_lines=3, max_chars=220), "  "))
+        if len(user_prompts) > 1 and last_prompt != first_prompt:
             parts.append("")
             parts.append(BOLD("Last User Prompt"))
-            parts.append(wrap(user_prompts[-1], "  "))
+            parts.append(wrap(clip_text(last_prompt, role="user", max_lines=3, max_chars=220), "  "))
         parts.append("")
 
     if hidden_count > 0:
@@ -326,7 +461,7 @@ def preview_jsonl(
         parts.append("")
 
     for role, text, ts in shown_msgs:
-        parts.append(render_message(role, text, ts))
+        parts.append(render_message(role, text, ts, terms=terms))
         parts.append("")
     return "\n".join(parts)
 
@@ -459,14 +594,15 @@ def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str) -> str
 # ---------------------------------------------------------------
 def main() -> int:
     if len(sys.argv) < 4:
-        print("usage: fzf-ai-preview <agent> <session_id> <source>", file=sys.stderr)
+        print("usage: fzf-ai-preview <agent> <session_id> <source> [query]", file=sys.stderr)
         return 2
     agent, sid, source = sys.argv[1], sys.argv[2], sys.argv[3]
+    query = sys.argv[4] if len(sys.argv) > 4 else ""
     try:
         if agent == "opencode":
             out = preview_opencode(sid, source)
         else:
-            out = preview_jsonl(Path(source), agent, sid)
+            out = preview_jsonl(Path(source), agent, sid, query=query)
         sys.stdout.write(out)
         sys.stdout.write("\n")
     except BrokenPipeError:

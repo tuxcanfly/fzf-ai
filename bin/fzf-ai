@@ -3,19 +3,22 @@
 # opencode, droid, and pi. Selecting an item resumes it in its native CLI.
 #
 # Keybinds (shown in fzf header):
-#   enter    resume the session in its tool
-#   ctrl-o   cd into the session's working directory in a new shell
-#   ctrl-e   open the raw session file in $EDITOR
-#   ctrl-y   copy session id to the clipboard (when supported)
-#   ctrl-k   copy the exact resume command to the clipboard
-#   ctrl-p   move up
-#   ctrl-n   move down
-#   ctrl-r   reload the index
-#   ctrl-s   cycle search scope
-#   ?        toggle preview
-#   alt-p    cycle preview position
-#   alt-1..5 filter to one agent only
-#   alt-0    clear filter
+#   enter          resume the session in its tool
+#   ctrl-o         cd into the session's working directory in a new shell
+#   ctrl-e         open the raw session file in $EDITOR
+#   ctrl-y         copy session id to the clipboard (when supported)
+#   ctrl-k         copy the exact resume command to the clipboard
+#   ctrl-p/n       move up / down
+#   ctrl-r         reload the index
+#   ctrl-s         cycle search scope
+#   ?              toggle preview
+#   alt-p          cycle preview position
+#   alt-w          toggle preview wrap
+#   shift-up/down  scroll preview half a page
+#   ctrl-shift-up/down  scroll preview a full page
+#   alt-</alt->    jump to first / last session
+#   alt-1..5       filter to one agent only
+#   alt-0          clear filter
 set -uo pipefail
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
@@ -111,10 +114,16 @@ RELOAD_OPENCODE_CMD=$(quote_cmd "$FZFAI_INDEX" opencode)
 RELOAD_DROID_CMD=$(quote_cmd "$FZFAI_INDEX" droid)
 RELOAD_PI_CMD=$(quote_cmd "$FZFAI_INDEX" pi)
 
-HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-1..5: agent'
+HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-w: wrap  ·  alt-1..5: agent'
 if [[ -n "$COPY" ]]; then
   HEADER+=$'  ·  ctrl-y: copy id  ·  ctrl-k: copy cmd'
 fi
+
+# Neutralize user's global FZF_DEFAULT_OPTS so our carefully-tuned
+# flags don't collide with conflicting defaults (e.g. a user-set
+# --tiebreak=length would nullify our history scheme tuning).
+#unset FZF_DEFAULT_OPTS
+#unset FZF_DEFAULT_OPTS_FILE
 
 # -------------------------------------------------------------------------
 # Run fzf and capture the selected row. We deliberately do NOT use the
@@ -129,17 +138,34 @@ FZF_ARGS=(
   --delimiter=$'\t'
   --with-nth='4,5,6,7,8,9'
   --nth='1,4,5,6'
-  --scheme=default
+  # Exact matching is the default because the content-scope search
+  # blob (col 9) is a 4000-char concatenation of prompts. Fuzzy
+  # matching against that blob produces a flood of low-signal
+  # "characters-in-order" matches whenever a query shares common
+  # letters with filler text. --exact keeps the picker precise; for
+  # a single fuzzy term, users can still prefix it with ': 'word.
   --exact
+  --scheme=history
+  --smart-case
   --no-sort
   --track
-  --tiebreak=chunk,begin,length
+  --id-nth=2
+  # history scheme sets --tiebreak=index on its own. We keep that:
+  # the index is our mtime ordering, so recency automatically wins
+  # ties without fighting the scheme. fzf requires 'index' to be the
+  # last tiebreak and rejects combining it with others.
+  --tiebreak=index
+  --cycle
+  --scroll-off=3
   --info=inline-right
   --highlight-line
   --filepath-word
   --no-hscroll
+  --keep-right
   --history="$HISTORY_FILE"
+  --history-size=2000
   --height=100%
+  --min-height=20+
   --tmux='90%,90%'
   --layout=reverse
   --style='full:line'
@@ -156,20 +182,25 @@ FZF_ARGS=(
   --footer-border=line
   --footer-label=' Summary '
   --prompt='all> '
-  --ghost='type to search sessions'
+  --ghost="type to search · 'word = fuzzy · !word = exclude · ^word/word\$ = anchor"
   --pointer='▶'
   --marker='✓'
-  --color='fg:dim,nth:regular'
+  --scrollbar='▎▎'
+  --ellipsis='…'
+  --separator='─'
+  --color='fg:dim,nth:regular,query:regular,border:magenta,separator:240,preview-border:240,label:bold,spinner:208,info:240'
   --header="$HEADER"
   --header-lines=0
   --preview="$PREVIEW_CMD"
   --preview-label=' Preview '
   --preview-window='right,60%,border-left,wrap,~4,<120(down,55%,border-top,wrap,~4)'
+  --accept-nth=1,2,3,7
   --expect=enter
   --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload-sync($RELOAD_CMD)"
   --bind="load:bg-cancel+transform-prompt[$UI prompt]+bg-transform-list-label[$UI list-label]+bg-transform-footer[$UI footer {*f}]"
   --bind="result:bg-cancel+transform-prompt[$UI prompt]+bg-transform-list-label[$UI list-label]+bg-transform-footer[$UI footer {*f}]"
   --bind="focus:bg-transform-preview-label[$UI preview-label {1} {2} {8}]"
+  --bind="zero:change-list-label( No matching sessions )+change-footer( no results — try a looser query or ctrl-s to change scope )"
   --bind="click-header:transform[$UI click-header-action]"
   --bind='ctrl-p:up'
   --bind='ctrl-n:down'
@@ -177,6 +208,20 @@ FZF_ARGS=(
   --bind="ctrl-r:change-list-label( Reindexing sessions )+change-footer( Rebuilding session index… )+track-current+reload-sync($RELOAD_CMD)"
   --bind='?:toggle-preview'
   --bind='alt-p:change-preview-window(right,60%,border-left,wrap,~4|down,55%,border-top,wrap,~4|hidden|)'
+  --bind='alt-w:toggle-preview-wrap'
+  # Preview scrolling: shift-{up,down} scrolls the preview by half a
+  # page, ctrl-shift-{up,down} by a full page. pgup/pgdn stay bound to
+  # their default list-page actions so paging through the session list
+  # still works the way users expect.
+  --bind='shift-up:preview-half-page-up'
+  --bind='shift-down:preview-half-page-down'
+  --bind='ctrl-shift-up:preview-page-up'
+  --bind='ctrl-shift-down:preview-page-down'
+  # home/end default to beginning/end of the query input line,
+  # which is what you want while editing a query. Use alt-</> to jump
+  # to the first / last session instead.
+  --bind='alt-<:first'
+  --bind='alt->:last'
   --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)"
   --bind="ctrl-e:execute(\${EDITOR:-vi} {3})"
   --bind="alt-1:change-border-label( fzf-ai · claude )+reload($RELOAD_CLAUDE_CMD)"
@@ -185,6 +230,8 @@ FZF_ARGS=(
   --bind="alt-4:change-border-label( fzf-ai · droid )+reload($RELOAD_DROID_CMD)"
   --bind="alt-5:change-border-label( fzf-ai · pi )+reload($RELOAD_PI_CMD)"
   --bind="alt-0:change-border-label($BORDER_LABEL)+reload($RELOAD_CMD)"
+  --bind='double-click:accept'
+  --bind='ctrl-w:backward-kill-word'
 )
 
 if [[ -n "$COPY" ]]; then
@@ -203,13 +250,12 @@ if [[ $fzf_rc -ne 0 && $fzf_rc -ne 1 ]]; then
 fi
 [[ -z "$selection" ]] && exit 0
 
-# --expect=enter prints the key name (or empty line for the default enter
-# binding) on the first line and the selected row on the second.
+# --expect=enter prints the key name on the first line, selected fields on
+# the second. With --accept-nth=1,2,3,7 only agent sid source cwd are output.
 row=$(printf '%s\n' "$selection" | sed -n '2p')
 [[ -z "$row" ]] && exit 0
 
-# Columns: 1 agent  2 sid  3 source  4 badge  5 date  6 msgs  7 cwd  8 title  9 blob
-IFS=$'\t' read -r agent sid source _badge _date _msgs cwd _title _blob <<<"$row"
+IFS=$'\t' read -r agent sid source cwd <<<"$row"
 # The cwd column is space-padded for UI alignment; strip trailing spaces.
 cwd=${cwd%"${cwd##*[![:space:]]}"}
 

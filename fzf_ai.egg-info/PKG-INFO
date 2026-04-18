@@ -69,18 +69,30 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
   (first real prompt, last user prompt, recent replies, tool calls,
   reasoning, model, cwd). Boilerplate environment / policy blocks are
   hidden from the preview when possible.
-* **Exact-match by default** across agent / cwd / title / hidden session
-  content snippets.
-  fzf runs with `--exact`, so typing `noita` finds sessions containing
-  `noita`. Use `'word` to fall back to fuzzy for a single term, `!word`
-  to exclude, `^word` / `word$` for prefix / suffix.
+* **Smart-case exact matching by default** across agent / cwd / title /
+  hidden session content snippets. `--exact` keeps matches high-signal
+  because the hidden content blob is a 4000-char concatenation of
+  prompts where fuzzy matching would otherwise flood the picker with
+  incidental letter-order hits. Recency breaks ties via
+  `--scheme=history` + `--tiebreak=index`. Prefix a word with `'` to
+  fuzzy-match that term, `!word` to exclude, `^word` / `word$` to
+  anchor, or `a | b` for OR.
 * Uses newer `fzf` features to make the picker behave like a small TUI:
-  * `reload-sync` for clean initial load and reindex without flicker
-  * `change-nth` + `FZF_NTH` to switch search scopes on the fly
-  * `click-header` so the scope tags in the header are clickable
-  * `bg-transform-*` + `{*f}` to render a live footer summary of matches
-  * `--history` for persistent query history between runs
-  * `--tmux` so it opens in a popup automatically when run inside tmux
+   * `reload-sync` for clean initial load and reindex without flicker
+   * `change-nth` + `FZF_NTH` to switch search scopes on the fly
+   * `click-header` so the scope tags in the header are clickable
+   * `bg-transform-*` + `{*f}` to render a live footer summary of matches
+   * `zero` event to show a clear "no matches" hint with a recovery tip
+   * `--history` for persistent query history between runs
+   * `--tmux` so it opens in a popup automatically when run inside tmux
+   * `--id-nth` for cross-reload tracking by session identity
+   * `--cycle` for wrap-around list navigation
+   * `--keep-right` so the title field stays visible on long rows
+   * `--exact` + `--scheme=history` + `--tiebreak=index` so matches are
+     literal (precise) and recency wins ties
+   * `--smart-case` so queries only become case-sensitive when you type
+     an uppercase letter
+   * `--accept-nth` for clean output parsing without visible fields leaking
 * On **enter**, fzf exits cleanly, then the launcher `exec`s the correct
   CLI from the session's original cwd. Using `exec`-after-exit (rather
   than fzf's `become` action) avoids a terminal-state race that caused
@@ -138,6 +150,12 @@ ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 Requires: `fzf` ≥ 0.63, `python3` (stdlib only), each AI CLI you want to
 resume on your `$PATH`.
 
+### Performance tuning
+
+The indexer reads session stores in parallel across agents and within each
+agent. Set `FZFAI_INDEX_JOBS=<n>` to override the per-agent worker count.
+The default is `min(32, cpu_count + 4)`.
+
 ## PyPI Publishing
 
 GitHub Actions trusted publishing is configured in
@@ -173,7 +191,7 @@ fzf-ai                    # browse everything
 fzf-ai claude codex       # only these agents
 ```
 
-### Search syntax (exact-match by default)
+### Search syntax (exact smart-case by default)
 
 | query             | meaning                                    |
 |-------------------|--------------------------------------------|
@@ -184,6 +202,13 @@ fzf-ai claude codex       # only these agents
 | `.md$`            | ends with `.md`                            |
 | `!draft`          | excludes items containing `draft`          |
 | `a | b | c`       | OR                                         |
+
+Queries are case-insensitive until you type an uppercase letter
+(`--smart-case`). Sessions are pre-sorted by last-modified time and
+`--tiebreak=index` preserves that order when match scores are equal.
+The default is `--exact` because the hidden content blob is long
+enough that fuzzy matching tends to return unrelated sessions whose
+letters happen to appear in the right order.
 
 ### Keys
 
@@ -200,6 +225,11 @@ fzf-ai claude codex       # only these agents
 | `ctrl-s`       | cycle search scope: `all → cwd → title → content → agent` |
 | `?`            | toggle preview pane                                |
 | `alt-p`        | cycle preview position / hide preview              |
+| `alt-w`        | toggle preview wrap                                |
+| `shift-up/down`| scroll preview by half a page                      |
+| `ctrl-shift-up/down` | scroll preview by a full page                |
+| `pgup/pgdn`    | page through the session list                      |
+| `alt-<` / `alt->` | jump to first / last session                    |
 | `alt-1..5`     | filter to claude / codex / opencode / droid / pi   |
 | `alt-0`        | clear the temporary agent filter                   |
 
@@ -269,7 +299,8 @@ rebuilding the list.
 
 ## Notes
 
-* The indexer reads JSONL session stores in parallel. Set
-  `FZFAI_INDEX_JOBS=<n>` to override the worker count.
+* The indexer reads JSONL session stores in parallel across agents and
+  within each agent. Set `FZFAI_INDEX_JOBS=<n>` to override the
+  per-agent worker count.
 * The launcher now requires `fzf >= 0.63.0` because it relies on
   `reload-sync`, footer sections, async transforms, and `{*f}`.

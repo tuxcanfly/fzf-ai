@@ -33,6 +33,8 @@ from typing import Callable, Iterator, Optional
 
 HOME = Path(os.path.expanduser("~"))
 HOME_STR = str(HOME)
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(HOME / ".cache"))) / "fzf-ai"
+INDEX_CACHE_VERSION = 1
 INDEX_JOBS = max(
     1,
     int(os.environ.get("FZFAI_INDEX_JOBS") or min(32, (os.cpu_count() or 4) + 4)),
@@ -46,7 +48,13 @@ _RE_WS_TAB_NL = re.compile(r"[\t\n]+")
 # test is both correct and ~5x faster than json.loads + dict lookup.
 # Any line whose "type" isn't in the agent's whitelist is discarded
 # before we even hit the JSON decoder.
-_JSON_LOADS = json.loads
+try:
+    import orjson
+    _JSON_LOADS = orjson.loads
+    _JSON_DUMPS = orjson.dumps
+except ImportError:
+    _JSON_LOADS = json.loads
+    _JSON_DUMPS = json.dumps
 
 MAX_TITLE = 120
 DISPLAY_CWD = 28
@@ -81,6 +89,139 @@ def colorise(agent: str) -> str:
         return f"{agent:<8}"
     code = _AGENT_COLOR.get(agent, "1")
     return f"\033[{code}m{agent:<8}\033[0m"
+
+
+# --------------------------------------------------------------------------
+# Index cache: avoid re-parsing unchanged session files on every startup.
+# Cache is keyed by source path (or "sqlite:<db>" for opencode).
+# Each entry stores the file's mtime + size for validation.
+# --------------------------------------------------------------------------
+def _get_index_cache_path() -> Path:
+    return CACHE_DIR / "index.json"
+
+
+def _load_index_cache() -> dict:
+    path = _get_index_cache_path()
+    if not path.is_file():
+        return {"v": INDEX_CACHE_VERSION, "sources": {}}
+    try:
+        data = _JSON_LOADS(path.read_bytes())
+        if isinstance(data, dict) and data.get("v") == INDEX_CACHE_VERSION:
+            return data
+    except Exception:
+        pass
+    return {"v": INDEX_CACHE_VERSION, "sources": {}}
+
+
+def _save_index_cache(cache: dict) -> None:
+    path = _get_index_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    content = _JSON_DUMPS(cache)
+    if isinstance(content, bytes):
+        tmp.write_bytes(content)
+    else:
+        tmp.write_text(content, encoding="utf-8")
+    tmp.rename(path)
+
+
+def _validate_cache_entry(entry: dict) -> bool:
+    """Check if a cache entry is still valid (file exists, mtime+size unchanged)."""
+    src = entry.get("source", "")
+    if src.startswith("sqlite:"):
+        db_path = Path(src[len("sqlite:"):])
+        return db_path.is_file() and db_path.stat().st_mtime == entry.get("mtime", 0)
+    p = Path(src)
+    if not p.is_file():
+        return False
+    try:
+        st = p.stat()
+        return st.st_mtime == entry.get("mtime", 0) and st.st_size == entry.get("size", 0)
+    except OSError:
+        return False
+
+
+def _file_cache_entry(path: Path, records: list[Record]) -> dict:
+    """Build a cache entry from a file path and its parsed records."""
+    try:
+        st = path.stat()
+        mtime, size = st.st_mtime, st.st_size
+    except OSError:
+        mtime, size = 0.0, 0
+    return {
+        "mtime": mtime,
+        "size": size,
+        "source": str(path),
+        "records": [
+            {
+                "agent": r.agent,
+                "session_id": r.session_id,
+                "source": r.source,
+                "updated": r.updated,
+                "msgs": r.msgs,
+                "cwd": r.cwd,
+                "title": r.title,
+                "prompts": r.prompts,
+            }
+            for r in records
+        ],
+    }
+
+
+def _db_cache_entry(db: Path, records: list[Record]) -> dict:
+    """Build a cache entry from a database path and its parsed records."""
+    try:
+        mtime = db.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return {
+        "mtime": mtime,
+        "size": 0,
+        "source": f"sqlite:{db}",
+        "records": [
+            {
+                "agent": r.agent,
+                "session_id": r.session_id,
+                "source": r.source,
+                "updated": r.updated,
+                "msgs": r.msgs,
+                "cwd": r.cwd,
+                "title": r.title,
+                "prompts": r.prompts,
+            }
+            for r in records
+        ],
+    }
+
+
+def _records_from_cache_entry(entry: dict) -> list[Record]:
+    """Reconstruct Record objects from a cache entry."""
+    records = []
+    for d in entry.get("records", []):
+        r = Record(
+            agent=d.get("agent", ""),
+            session_id=d.get("session_id", ""),
+            source=d.get("source", ""),
+            updated=d.get("updated", 0.0),
+            msgs=d.get("msgs", 0),
+            cwd=d.get("cwd", ""),
+            title=d.get("title", ""),
+            prompts=d.get("prompts", []),
+        )
+        records.append(r)
+    return records
+
+
+def _collect_jsonl_paths(root: Path, glob_pat: str = "*.jsonl") -> list[Path]:
+    """Collect all JSONL paths from a root directory (non-recursive by default)."""
+    if not root.is_dir():
+        return []
+    paths: list[Path] = []
+    for proj in root.iterdir():
+        if not proj.is_dir():
+            continue
+        paths.extend(proj.glob(glob_pat))
+    return paths
 
 
 @dataclass
@@ -245,16 +386,19 @@ def _parallel_read(
 # --------------------------------------------------------------------------
 # Claude Code  -- ~/.claude/projects/<enc-cwd>/<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_claude() -> Iterator[Record]:
+def walk_claude(cache: dict = None) -> Iterator[Record]:
     root = HOME / ".claude" / "projects"
-    if not root.is_dir():
-        return
-    paths: list[Path] = []
-    for proj in root.iterdir():
-        if not proj.is_dir():
-            continue
-        paths.extend(proj.glob("*.jsonl"))
-    yield from _parallel_read(paths, _read_claude_file, "claude")
+    sources = cache.get("sources", {}) if cache else {}
+    uncached_paths: list[Path] = []
+    for path in _collect_jsonl_paths(root):
+        entry = sources.get(str(path))
+        if entry and _validate_cache_entry(entry):
+            yield from _records_from_cache_entry(entry)
+        else:
+            uncached_paths.append(path)
+    for rec in _parallel_read(uncached_paths, _read_claude_file, "claude"):
+        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
+        yield rec
 
 
 def _read_claude_file(path: Path) -> Optional[Record]:
@@ -318,12 +462,19 @@ def _read_claude_file(path: Path) -> Optional[Record]:
 # --------------------------------------------------------------------------
 # Codex  -- ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_codex() -> Iterator[Record]:
+def walk_codex(cache: dict = None) -> Iterator[Record]:
     root = HOME / ".codex" / "sessions"
-    if not root.is_dir():
-        return
-    paths = list(root.rglob("rollout-*.jsonl"))
-    yield from _parallel_read(paths, _read_codex_file, "codex")
+    sources = cache.get("sources", {}) if cache else {}
+    uncached_paths: list[Path] = []
+    for path in root.rglob("rollout-*.jsonl"):
+        entry = sources.get(str(path))
+        if entry and _validate_cache_entry(entry):
+            yield from _records_from_cache_entry(entry)
+        else:
+            uncached_paths.append(path)
+    for rec in _parallel_read(uncached_paths, _read_codex_file, "codex"):
+        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
+        yield rec
 
 
 def _read_codex_file(path: Path) -> Optional[Record]:
@@ -569,9 +720,16 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
         yield rec
 
 
-def walk_opencode() -> Iterator[Record]:
-    seen_sids: set[str] = set()
+def walk_opencode(cache: dict = None) -> Iterator[Record]:
+    sources = cache.get("sources", {}) if cache else {}
     for db in _opencode_db_paths():
+        src_key = f"sqlite:{db}"
+        entry = sources.get(src_key)
+        if entry and _validate_cache_entry(entry):
+            yield from _records_from_cache_entry(entry)
+            continue
+        records: list[Record] = []
+        seen_sids: set[str] = set()
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             con.execute("PRAGMA journal_mode=WAL")
@@ -591,26 +749,32 @@ def walk_opencode() -> Iterator[Record]:
                 if rec.session_id in seen_sids:
                     continue
                 seen_sids.add(rec.session_id)
+                records.append(rec)
                 yield rec
         except sqlite3.Error as e:
             print(f"opencode: {db}: {e}", file=sys.stderr)
         finally:
             con.close()
+        if records:
+            sources[src_key] = _db_cache_entry(db, records)
 
 
 # --------------------------------------------------------------------------
 # Droid / Factory -- ~/.factory/sessions/<proj>/<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_droid() -> Iterator[Record]:
+def walk_droid(cache: dict = None) -> Iterator[Record]:
     root = HOME / ".factory" / "sessions"
-    if not root.is_dir():
-        return
-    paths: list[Path] = []
-    for proj in root.iterdir():
-        if not proj.is_dir():
-            continue
-        paths.extend(proj.glob("*.jsonl"))
-    yield from _parallel_read(paths, _read_droid_file, "droid")
+    sources = cache.get("sources", {}) if cache else {}
+    uncached_paths: list[Path] = []
+    for path in _collect_jsonl_paths(root):
+        entry = sources.get(str(path))
+        if entry and _validate_cache_entry(entry):
+            yield from _records_from_cache_entry(entry)
+        else:
+            uncached_paths.append(path)
+    for rec in _parallel_read(uncached_paths, _read_droid_file, "droid"):
+        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
+        yield rec
 
 
 def _read_droid_file(path: Path) -> Optional[Record]:
@@ -676,16 +840,19 @@ def _read_droid_file(path: Path) -> Optional[Record]:
 # --------------------------------------------------------------------------
 # pi  -- ~/.pi/agent/sessions/<enc-cwd>/<iso>_<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_pi() -> Iterator[Record]:
+def walk_pi(cache: dict = None) -> Iterator[Record]:
     root = HOME / ".pi" / "agent" / "sessions"
-    if not root.is_dir():
-        return
-    paths: list[Path] = []
-    for proj in root.iterdir():
-        if not proj.is_dir():
-            continue
-        paths.extend(proj.glob("*.jsonl"))
-    yield from _parallel_read(paths, _read_pi_file, "pi")
+    sources = cache.get("sources", {}) if cache else {}
+    uncached_paths: list[Path] = []
+    for path in _collect_jsonl_paths(root):
+        entry = sources.get(str(path))
+        if entry and _validate_cache_entry(entry):
+            yield from _records_from_cache_entry(entry)
+        else:
+            uncached_paths.append(path)
+    for rec in _parallel_read(uncached_paths, _read_pi_file, "pi"):
+        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
+        yield rec
 
 
 def _read_pi_file(path: Path) -> Optional[Record]:
@@ -763,6 +930,9 @@ WALKERS = {
 
 
 def main() -> int:
+    import signal
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    cache = _load_index_cache()
     agents = sys.argv[1:] or list(WALKERS.keys())
     records: list[Record] = []
     if len(agents) > 1 and INDEX_JOBS > 1:
@@ -773,7 +943,7 @@ def main() -> int:
                 if not walker:
                     print(f"unknown agent: {a}", file=sys.stderr)
                     continue
-                future_map[pool.submit(lambda w: list(w()), walker)] = a
+                future_map[pool.submit(lambda w: list(w(cache)), walker)] = a
             for future in as_completed(future_map):
                 a = future_map[future]
                 try:
@@ -787,9 +957,13 @@ def main() -> int:
                 print(f"unknown agent: {a}", file=sys.stderr)
                 continue
             try:
-                records.extend(walker())
+                records.extend(walker(cache))
             except Exception as e:
                 print(f"{a}: {e}", file=sys.stderr)
+    try:
+        _save_index_cache(cache)
+    except Exception:
+        pass
     records.sort(key=lambda r: r.updated, reverse=True)
     # One big write is a touch faster and, more importantly, atomic: fzf
     # won't see partially-written rows if the caller redirects to a pipe.

@@ -9,6 +9,13 @@ from __future__ import annotations
 
 from collections import Counter
 import json
+try:
+    import orjson
+    _JSON_LOADS = orjson.loads
+    _JSON_DUMPS = orjson.dumps
+except ImportError:
+    _JSON_LOADS = json.loads
+    _JSON_DUMPS = json.dumps
 import os
 import re
 import shutil
@@ -20,6 +27,59 @@ from pathlib import Path
 
 # ANSI colors (respect NO_COLOR). fzf renders ANSI in the preview window.
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
+
+# Preview cache: avoid re-parsing large JSONL files on every preview.
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "fzf-ai"
+PREVIEW_CACHE_VERSION = 1
+
+
+def _get_preview_cache_path() -> Path:
+    return CACHE_DIR / "preview.json"
+
+
+def _load_preview_cache() -> dict:
+    path = _get_preview_cache_path()
+    if not path.is_file():
+        return {"v": PREVIEW_CACHE_VERSION, "sessions": {}}
+    try:
+        data = _JSON_LOADS(path.read_bytes())
+        if isinstance(data, dict) and data.get("v") == PREVIEW_CACHE_VERSION:
+            return data
+    except Exception:
+        pass
+    return {"v": PREVIEW_CACHE_VERSION, "sessions": {}}
+
+
+def _save_preview_cache(cache: dict) -> None:
+    path = _get_preview_cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    content = _JSON_DUMPS(cache)
+    if isinstance(content, bytes):
+        tmp.write_bytes(content)
+    else:
+        tmp.write_text(content, encoding="utf-8")
+    tmp.rename(path)
+
+
+def _preview_cache_key(agent: str, sid: str) -> str:
+    return f"{agent}:{sid}"
+
+
+def _validate_preview_cache_entry(entry: dict) -> bool:
+    """Check if a preview cache entry is still valid."""
+    src = entry.get("source", "")
+    if src.startswith("sqlite:"):
+        db_path = Path(src[len("sqlite:"):])
+        return db_path.is_file() and db_path.stat().st_mtime == entry.get("mtime", 0)
+    p = Path(src)
+    if not p.is_file():
+        return False
+    try:
+        st = p.stat()
+        return st.st_mtime == entry.get("mtime", 0) and st.st_size == entry.get("size", 0)
+    except OSError:
+        return False
 
 
 def c(code: str, s: str) -> str:
@@ -337,71 +397,103 @@ def preview_jsonl(
     messages: list[tuple[str, str, str]] = []
     if not path.is_file():
         return RED(f"file not found: {path}")
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if agent == "claude":
-                if obj.get("cwd") and not cwd:
-                    cwd = obj["cwd"]
-                if obj.get("type") in ("user", "assistant"):
-                    if obj.get("isMeta"):
-                        continue
-                    m = obj.get("message") or {}
-                    role = m.get("role") or obj["type"]
-                    text = extract_text(m.get("content"))
-                    if text:
-                        ts = fmt_ts(obj.get("timestamp"))
-                        messages.append((role, text, ts))
-                        total += 1
-            elif agent == "codex":
-                p = obj.get("payload") or {}
-                t = obj.get("type")
-                if t == "session_meta":
-                    if p.get("cwd") and not cwd:
-                        cwd = p["cwd"]
-                if t == "response_item" and p.get("type") == "message":
-                    role = p.get("role")
-                    text = extract_text(p.get("content"))
-                    if text:
-                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
-                        total += 1
-                elif t == "response_item" and p.get("type") == "reasoning":
-                    text = extract_text([p])
-                    if text:
-                        messages.append(("assistant", text, fmt_ts(obj.get("timestamp"))))
-                        total += 1
-            elif agent == "droid":
-                t = obj.get("type")
-                if t == "session_start":
+
+    # Check preview cache
+    preview_cache = _load_preview_cache()
+    cache_key = _preview_cache_key(agent, sid)
+    cache_entry = preview_cache.get("sessions", {}).get(cache_key)
+    cache_valid = (
+        cache_entry
+        and cache_entry.get("source") == str(path)
+        and _validate_preview_cache_entry(cache_entry)
+    )
+    if cache_valid:
+        cwd = cache_entry.get("cwd", "")
+        model = cache_entry.get("model", "")
+        total = cache_entry.get("total", 0)
+        messages = [tuple(m) for m in cache_entry.get("messages", [])]
+    else:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _JSON_LOADS(line)
+                except json.JSONDecodeError:
+                    continue
+                if agent == "claude":
                     if obj.get("cwd") and not cwd:
                         cwd = obj["cwd"]
-                elif t == "message":
-                    m = obj.get("message") or {}
-                    role = m.get("role")
-                    text = extract_text(m.get("content"))
-                    if text:
-                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
-                        total += 1
-            elif agent == "pi":
-                t = obj.get("type")
-                if t == "session":
-                    if obj.get("cwd") and not cwd:
-                        cwd = obj["cwd"]
-                elif t == "model_change":
-                    model = obj.get("modelId") or model
-                elif t == "message":
-                    m = obj.get("message") or {}
-                    role = m.get("role")
-                    text = extract_text(m.get("content"))
-                    if text:
-                        messages.append((role, text, fmt_ts(obj.get("timestamp"))))
-                        total += 1
+                    if obj.get("type") in ("user", "assistant"):
+                        if obj.get("isMeta"):
+                            continue
+                        m = obj.get("message") or {}
+                        role = m.get("role") or obj["type"]
+                        text = extract_text(m.get("content"))
+                        if text:
+                            ts = fmt_ts(obj.get("timestamp"))
+                            messages.append((role, text, ts))
+                            total += 1
+                elif agent == "codex":
+                    p = obj.get("payload") or {}
+                    t = obj.get("type")
+                    if t == "session_meta":
+                        if p.get("cwd") and not cwd:
+                            cwd = p["cwd"]
+                    if t == "response_item" and p.get("type") == "message":
+                        role = p.get("role")
+                        text = extract_text(p.get("content"))
+                        if text:
+                            messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                            total += 1
+                    elif t == "response_item" and p.get("type") == "reasoning":
+                        text = extract_text([p])
+                        if text:
+                            messages.append(("assistant", text, fmt_ts(obj.get("timestamp"))))
+                            total += 1
+                elif agent == "droid":
+                    t = obj.get("type")
+                    if t == "session_start":
+                        if obj.get("cwd") and not cwd:
+                            cwd = obj["cwd"]
+                    elif t == "message":
+                        m = obj.get("message") or {}
+                        role = m.get("role")
+                        text = extract_text(m.get("content"))
+                        if text:
+                            messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                            total += 1
+                elif agent == "pi":
+                    t = obj.get("type")
+                    if t == "session":
+                        if obj.get("cwd") and not cwd:
+                            cwd = obj["cwd"]
+                    elif t == "model_change":
+                        model = obj.get("modelId") or model
+                    elif t == "message":
+                        m = obj.get("message") or {}
+                        role = m.get("role")
+                        text = extract_text(m.get("content"))
+                        if text:
+                            messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                            total += 1
+
+        # Save to preview cache
+        try:
+            st = path.stat()
+            preview_cache.setdefault("sessions", {})[cache_key] = {
+                "mtime": st.st_mtime,
+                "size": st.st_size,
+                "source": str(path),
+                "cwd": cwd,
+                "model": model,
+                "total": total,
+                "messages": [list(m) for m in messages],
+            }
+            _save_preview_cache(preview_cache)
+        except Exception:
+            pass
 
     visible_messages = [
         (role, text, ts)
@@ -517,7 +609,7 @@ def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str) -> st
         (sid,),
     ):
         try:
-            parts_by_msg.setdefault(mid, []).append(json.loads(pdata))
+            parts_by_msg.setdefault(mid, []).append(_JSON_LOADS(pdata))
         except Exception:
             pass
 
@@ -533,7 +625,7 @@ def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str) -> st
             lines.append(DIM(f"    … ({hidden} messages hidden) …"))
             lines.append("")
         try:
-            d = json.loads(mdata)
+            d = _JSON_LOADS(mdata)
         except Exception:
             d = {}
         role = d.get("role", "?")
@@ -580,7 +672,7 @@ def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str) -> str
             lines.append(DIM(f"    … ({hidden} messages hidden) …"))
             lines.append("")
         try:
-            p = json.loads(parts_json)
+            p = _JSON_LOADS(parts_json)
         except Exception:
             p = []
         text = extract_text(p)

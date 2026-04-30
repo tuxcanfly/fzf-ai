@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: fzf-ai
-Version: 1.0.0
+Version: 1.2.0
 Summary: Fuzzy-find and resume any AI coding session across multiple AI assistants
 Home-page: https://github.com/tuxcanfly/fzf-ai
 Author: tuxcanfly
@@ -16,16 +16,17 @@ Classifier: Intended Audience :: Developers
 Classifier: License :: OSI Approved :: MIT License
 Classifier: Operating System :: OS Independent
 Classifier: Programming Language :: Python :: 3
-Classifier: Programming Language :: Python :: 3.7
-Classifier: Programming Language :: Python :: 3.8
-Classifier: Programming Language :: Python :: 3.9
 Classifier: Programming Language :: Python :: 3.10
 Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
 Classifier: Topic :: Software Development :: Code Generators
 Classifier: Topic :: Text Processing :: Filters
-Requires-Python: >=3.7
+Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 License-File: LICENSE
+Provides-Extra: fast
+Requires-Dist: orjson; extra == "fast"
 Dynamic: author
 Dynamic: classifier
 Dynamic: description
@@ -35,6 +36,7 @@ Dynamic: keywords
 Dynamic: license
 Dynamic: license-file
 Dynamic: project-url
+Dynamic: provides-extra
 Dynamic: requires-python
 Dynamic: summary
 

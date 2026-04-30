@@ -30,23 +30,23 @@ setup(
     license="MIT",
     packages=[],  # We're installing scripts directly, not Python packages
     include_package_data=True,
-    python_requires=">=3.7",
-    install_requires=[
-        # No external dependencies - uses only Python standard library
-    ],
+    python_requires=">=3.10",
+    install_requires=[],
+    extras_require={
+        "fast": ["orjson"],
+    },
     # Entry points not needed - scripts are installed directly as data files
     classifiers=[
         "Development Status :: 4 - Beta",
         "Environment :: Console",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: MIT License",  # Update if using different license
+        "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
         "Topic :: Software Development :: Code Generators",
         "Topic :: Text Processing :: Filters",
     ],

@@ -5,7 +5,7 @@ class FzfAi < Formula
   desc "Fuzzy-find and resume any AI coding session"
   homepage "https://github.com/tuxcanfly/fzf-ai"
   url "https://github.com/tuxcanfly/fzf-ai/archive/refs/tags/v2.0.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "59a78314774d1e135d3df9aa5b3542d050676dbb19a0ff0949312b4f866f316c"
   license "MIT"
 
   depends_on "python@3.13"

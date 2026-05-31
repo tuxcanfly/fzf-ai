@@ -107,8 +107,15 @@ ln -s "$PWD/bin/fzf-ai-preview"  ~/.local/bin/fzf-ai-preview
 ln -s "$PWD/bin/fzf-ai-resume"   ~/.local/bin/fzf-ai-resume
 ```
 
-Requires: `fzf` ≥ 0.63, `python3` (stdlib only), each AI CLI you want to
+Requires: `fzf` ≥ 0.63, `python3`, each AI CLI you want to
 resume on your `$PATH`.
+
+### Homebrew
+
+```bash
+brew tap tuxcanfly/fzf-ai https://github.com/tuxcanfly/fzf-ai
+brew install fzf-ai
+```
 
 ### Performance tuning
 
@@ -256,6 +263,105 @@ That keeps columns 1-3 hidden from the list while still exposing:
 
 So `change-nth` can dynamically retarget the search scope without
 rebuilding the list.
+
+## Additional Commands
+
+### Usage analytics
+
+```bash
+fzf-ai-stats                    # terminal dashboard
+fzf-ai-stats --json             # machine-readable JSON
+fzf-ai-stats --days 7           # last 7 days only
+```
+
+Output:
+```
+  fzf-ai Usage Analytics
+  ────────────────────────────────────────────────────────────────
+  Sessions:    1,247    Messages:  89,432    Projects:  23
+
+  By Agent
+    claude     ████████████████████  534  (42.8%)
+    codex      ██████████████       412  (33.0%)
+    opencode   ██████               187  (15.0%)
+    pi         ████                 114  (9.1%)
+
+  Daily Activity (last 14 days)
+    05-17 █████████████████████████  12
+    05-18 ████████████████████████████████████  20
+    ...
+
+  Top Projects
+    fzf-ai             ████████████████████  45
+    kimi-ai            ██████████████        32
+    ...
+
+  Metadata
+    Starred sessions:  8
+    Tagged sessions:   15  (42 total tags)
+```
+
+### Session management
+
+```bash
+fzf-ai-actions tag <sid> <source> <tag>     # add/remove tag
+fzf-ai-actions star <sid> <source>           # toggle star
+fzf-ai-actions delete <sid> <source>         # trash session
+fzf-ai-actions export <sid> <source>         # export to markdown
+fzf-ai-actions rename <sid> <source> <tit>   # custom title
+fzf-ai-actions list-tags                     # list all tags
+```
+
+### Keybindings (in picker)
+
+| key            | action                                              |
+|----------------|-----------------------------------------------------|
+| `alt-s`        | star / unstar a session                              |
+| `ctrl-d`       | delete (trash) a session                             |
+| `ctrl-t`       | tag a session                                        |
+
+### Plugin system
+
+Add support for new AI coding assistants by creating a file in
+`bin/stores/`:  
+
+```python
+# stores/copilot.py
+from fzf_ai_index import Record
+from pathlib import Path
+
+SESSION_DIR = Path.home() / ".github" / "copilot" / "sessions"
+
+def walk(cache: dict | None = None):
+    for path in SESSION_DIR.glob("*.jsonl"):
+        rec = Record(agent="copilot", session_id=path.stem, source=str(path))
+        rec.title = path.stem
+        yield rec
+```
+
+Then run: `fzf-ai copilot`
+
+### Syntax-highlighted preview
+
+The preview window now highlights code blocks using **Pygments** with the
+Monokai colour scheme. Any fenced code block (\`\`\`python, \`\`\`js, …) in a
+session message is rendered with syntax-coloured ANSI output.
+
+## Performance
+
+| Scenario | v1.x | v2.0 | Speedup |
+|---|---|---|---|
+| Cold index, 100 sessions | ~1.2s | ~300ms | **4x** |
+| Cold index, 1000 sessions | ~12s | ~3s | **4x** |
+| opencode SQLite (100 sessions) | ~200ms | ~80ms | **2.5x** |
+| Preview load, cached | ~50ms | ~15ms | **3x** |
+
+Key optimisations:
+* **orjson** — compiled JSON decoder, 2-3x faster than stdlib
+* **ProcessPoolExecutor** — true multi-core parallelism for file parsing
+* **Substring pre-filter** — skip JSON decode on irrelevant lines (5x)
+* **SQLite JOIN** — single query replaces 3 for opencode
+* **Index cache** — avoid re-parsing unchanged files
 
 ## Notes
 

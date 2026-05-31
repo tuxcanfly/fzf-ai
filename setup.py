@@ -31,11 +31,8 @@ setup(
     packages=[],  # We're installing scripts directly, not Python packages
     include_package_data=True,
     python_requires=">=3.10",
-    install_requires=[],
-    extras_require={
-        "fast": ["orjson"],
-    },
-    # Entry points not needed - scripts are installed directly as data files
+    install_requires=["orjson>=3.10"],
+    extras_require={},
     classifiers=[
         "Development Status :: 4 - Beta",
         "Environment :: Console",
@@ -57,13 +54,19 @@ setup(
         "Issues": "https://github.com/tuxcanfly/fzf-ai/issues",
     },
     data_files=[
-        # Include the bin scripts
         ('bin', [
             'bin/fzf-ai',
             'bin/fzf-ai-index', 
             'bin/fzf-ai-preview',
             'bin/fzf-ai-resume',
             'bin/fzf-ai-ui',
+            'bin/fzf-ai-actions',
+            'bin/fzf-ai-highlight',
+            'bin/fzf-ai-stats',
+        ]),
+        ('bin/stores', [
+            'bin/stores/__init__.py',
+            'bin/stores/EXAMPLE.py',
         ]),
     ],
     zip_safe=False,

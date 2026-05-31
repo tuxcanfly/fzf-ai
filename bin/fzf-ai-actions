@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""fzf-ai-actions: session management actions (tag, star, delete, export).
+
+Usage:
+    fzf-ai-actions tag <sid> <source> <tag>       # Tag a session
+    fzf-ai-actions star <sid> <source>              # Toggle star
+    fzf-ai-actions delete <sid> <source>             # Trash a session
+    fzf-ai-actions export <sid> <source> [--format]  # Export to markdown
+    fzf-ai-actions rename <sid> <source> <title>     # Rename session
+    fzf-ai-actions list-tags                         # List all tags
+"""
+
+from __future__ import annotations
+
+import json as stdjson
+import os
+import shutil
+import sys
+from pathlib import Path
+
+try:
+    import orjson
+    _JSON_DUMPS = orjson.dumps
+except ImportError:
+    _JSON_DUMPS = stdjson.dumps
+
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+FZFAI_DIR = STATE_HOME / "fzf-ai"
+
+# Session metadata storage
+TAGS_FILE = FZFAI_DIR / "tags.json"
+STARS_FILE = FZFAI_DIR / "stars.json"
+TRASH_DIR = FZFAI_DIR / "trash"
+
+
+def _load_json(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        return stdjson.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(
+        stdjson.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.rename(path)
+
+
+def cmd_tag(sid: str, source: str, tag: str) -> int:
+    """Add or remove a tag from a session."""
+    data = _load_json(TAGS_FILE)
+    tags = data.setdefault(sid, [])
+    if tag in tags:
+        tags.remove(tag)
+        print(f"Removed tag '{tag}' from {sid}")
+    else:
+        tags.append(tag)
+        print(f"Added tag '{tag}' to {sid}")
+    # Clean up empty entries
+    if not tags:
+        data.pop(sid, None)
+    _save_json(TAGS_FILE, data)
+    return 0
+
+
+def cmd_star(sid: str, source: str) -> int:
+    """Toggle star (favorite) on a session."""
+    data = _load_json(STARS_FILE)
+    if sid in data:
+        del data[sid]
+        print(f"Unstarred {sid}")
+    else:
+        data[sid] = {"source": source}
+        print(f"Starred {sid}")
+    _save_json(STARS_FILE, data)
+    return 0
+
+
+def cmd_delete(sid: str, source: str) -> int:
+    """Move a session file to the trash."""
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    src_path = Path(source)
+
+    if source.startswith("sqlite:"):
+        print(f"Cannot delete SQLite session {sid} (delete from tool directly)", file=sys.stderr)
+        return 1
+
+    if not src_path.is_file():
+        print(f"Session file not found: {source}", file=sys.stderr)
+        return 1
+
+    dest = TRASH_DIR / f"{sid}_{src_path.name}"
+    shutil.move(str(src_path), str(dest))
+    print(f"Deleted {sid} (moved to {dest})")
+    return 0
+
+
+def cmd_export(sid: str, source: str, fmt: str = "markdown") -> int:
+    """Export a session to markdown (reads the raw file)."""
+    src_path = Path(source)
+
+    if source.startswith("sqlite:"):
+        print("Export from SQLite not yet supported (use --format json)", file=sys.stderr)
+        return 1
+
+    if not src_path.is_file():
+        print(f"Session file not found: {source}", file=sys.stderr)
+        return 1
+
+    out_path = FZFAI_DIR / "exports" / f"{sid}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8") as out:
+        out.write(f"# Session: {sid}\n\n")
+        out.write(f"**Source:** {source}\n\n")
+        out.write("## Conversation\n\n")
+
+        with open(src_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = stdjson.loads(line)
+                except Exception:
+                    continue
+                t = obj.get("type")
+                if t == "user":
+                    role = "User"
+                elif t == "assistant":
+                    role = "Assistant"
+                else:
+                    continue
+                msg = obj.get("message") or {}
+                texts = _extract_texts(msg.get("content"))
+                for text in texts:
+                    out.write(f"### {role}\n\n{text}\n\n")
+
+    print(f"Exported to {out_path}")
+    return 0
+
+
+def _extract_texts(content) -> list[str]:
+    """Extract text strings from message content in various formats."""
+    texts = []
+    if content is None:
+        return texts
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                t = part.get("text") or (part.get("data") or {}).get("text", "")
+                if t:
+                    texts.append(t)
+    return texts
+
+
+def cmd_list_tags() -> int:
+    """List all tags and their sessions."""
+    data = _load_json(TAGS_FILE)
+    if not data:
+        print("No tags found.")
+        return 0
+    for sid, tags in sorted(data.items()):
+        print(f"{sid}: {', '.join(tags)}")
+    return 0
+
+
+def cmd_rename(sid: str, source: str, title: str) -> int:
+    """Persist a custom title for a session (stored locally)."""
+    data = _load_json(FZFAI_DIR / "titles.json")
+    data[sid] = title
+    _save_json(FZFAI_DIR / "titles.json", data)
+    print(f"Renamed {sid} to '{title}'")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+
+    cmd = sys.argv[1]
+
+    if cmd == "list-tags":
+        return cmd_list_tags()
+    if cmd == "tag" and len(sys.argv) >= 5:
+        return cmd_tag(sys.argv[2], sys.argv[3], sys.argv[4])
+    if cmd == "star" and len(sys.argv) >= 4:
+        return cmd_star(sys.argv[2], sys.argv[3])
+    if cmd == "delete" and len(sys.argv) >= 4:
+        return cmd_delete(sys.argv[2], sys.argv[3])
+    if cmd == "export" and len(sys.argv) >= 4:
+        fmt = sys.argv[4] if len(sys.argv) > 4 else "markdown"
+        return cmd_export(sys.argv[2], sys.argv[3], fmt)
+    if cmd == "rename" and len(sys.argv) >= 5:
+        return cmd_rename(sys.argv[2], sys.argv[3], sys.argv[4])
+
+    print(f"Unknown command or missing args: {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

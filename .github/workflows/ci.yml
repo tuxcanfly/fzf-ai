@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
   workflow_dispatch:
 
@@ -11,8 +11,69 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Validate package and scripts
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install orjson pygments ruff
+
+      - name: Validate shell scripts (bash -n)
+        run: bash -n bin/fzf-ai bin/fzf-ai-resume bin/fzf-ai-ui
+
+      - name: Validate Python scripts (py_compile)
+        run: |
+          python -m py_compile bin/fzf-ai-index
+          python -m py_compile bin/fzf-ai-preview
+          python -m py_compile bin/fzf-ai-actions
+          python -m py_compile bin/fzf-ai-stats
+          python -m py_compile bin/fzf-ai-highlight
+          python -m py_compile bin/stores/__init__.py
+          python -m py_compile setup.py
+
+      - name: Lint with ruff
+        run: python -m ruff check bin/ --ignore=E402,E501,F401
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install orjson pygments pytest
+
+      - name: Run tests
+        run: |
+          PYTHONPATH="$PWD/bin" python -m pytest tests/ -v --tb=short
+
+  validate-build:
+    name: Validate build
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
@@ -27,14 +88,14 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Validate shell scripts
-        run: bash -n bin/fzf-ai bin/fzf-ai-resume bin/fzf-ai-ui
-
-      - name: Validate Python scripts
-        run: python -m py_compile bin/fzf-ai-index bin/fzf-ai-preview setup.py
-
       - name: Build distributions
         run: python -m build
 
       - name: Check distributions
         run: twine check dist/*
+
+      - name: Install from sdist
+        run: |
+          python -m pip install dist/*.tar.gz
+          python -c "import orjson; print('orjson OK')"
+          python -c "import pygments; print('pygments OK')"

@@ -20,8 +20,8 @@ at the top.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import json
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import json as stdjson
 import os
 import re
 import sqlite3
@@ -30,6 +30,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Optional
+
+# Fast JSON via orjson (hard dependency). Accepts bytes to skip a decode step.
+import orjson
+
+_JSON_LOADS = orjson.loads
+_JSON_DUMPS = orjson.dumps
 
 HOME = Path(os.path.expanduser("~"))
 HOME_STR = str(HOME)
@@ -41,20 +47,6 @@ INDEX_JOBS = max(
 )
 _RE_WS = re.compile(r"\s+")
 _RE_WS_TAB_NL = re.compile(r"[\t\n]+")
-
-# Pre-filter substrings used to skip JSON parsing on lines that are
-# guaranteed to be irrelevant. JSON emitted by every agent puts
-# "type":"<value>" as a compact, unquoted key so a plain substring
-# test is both correct and ~5x faster than json.loads + dict lookup.
-# Any line whose "type" isn't in the agent's whitelist is discarded
-# before we even hit the JSON decoder.
-try:
-    import orjson
-    _JSON_LOADS = orjson.loads
-    _JSON_DUMPS = orjson.dumps
-except ImportError:
-    _JSON_LOADS = json.loads
-    _JSON_DUMPS = json.dumps
 
 MAX_TITLE = 120
 DISPLAY_CWD = 28
@@ -371,7 +363,7 @@ def _parallel_read(
                 print(f"{label}: {path}: {e}", file=sys.stderr)
         return
 
-    with ThreadPoolExecutor(max_workers=min(INDEX_JOBS, len(paths))) as pool:
+    with ProcessPoolExecutor(max_workers=min(INDEX_JOBS, len(paths))) as pool:
         futures = {pool.submit(reader, path): path for path in paths}
         for future in as_completed(futures):
             path = futures[future]
@@ -426,7 +418,7 @@ def _read_claude_file(path: Path) -> Optional[Record]:
                 continue
             try:
                 obj = _JSON_LOADS(line)
-            except json.JSONDecodeError:
+            except stdjson.JSONDecodeError:
                 continue
             if not cwd:
                 c = obj.get("cwd")
@@ -506,7 +498,7 @@ def _read_codex_file(path: Path) -> Optional[Record]:
                 continue
             try:
                 obj = _JSON_LOADS(line)
-            except json.JSONDecodeError:
+            except stdjson.JSONDecodeError:
                 continue
             t = obj.get("type")
             payload = obj.get("payload") or {}
@@ -598,41 +590,28 @@ def _opencode_walk_current(con: sqlite3.Connection, db: Path) -> Iterator[Record
     msg_count: dict[str, int] = {}
     for sid, c in con.execute(
         "SELECT session_id, COUNT(*) FROM message "
-        "WHERE data LIKE '%\"role\":\"user\"%' OR data LIKE '%\"role\":\"assistant\"%' "
+        "WHERE data LIKE '%' || char(34) || 'role' || char(34) || ':' || char(34) || '%' "
         "GROUP BY session_id"
     ):
         msg_count[sid] = c
 
-    # Build message_id -> role once with a LIKE-based query. This is
-    # dramatically faster than calling json_extract on every row because
-    # LIKE short-circuits on the compact "role":"..." prefix and the
-    # planner can use the primary-key index on message.
-    msg_role: dict[str, str] = {}
-    for mid, data in con.execute("SELECT id, data FROM message"):
-        if '"role":"user"' in data:
-            msg_role[mid] = "user"
-        elif '"role":"assistant"' in data:
-            msg_role[mid] = "assistant"
-
-    # Narrow the parts query: skip synthetic via LIKE (json_extract was
-    # >2x slower on large dbs). Also extract text with json_extract only
-    # on text parts so the path stays hot on the index.
+    # Single JOIN query replaces 3 separate queries (msg_role lookup + parts scan).
+    # json_extract on the JOIN is fast enough when the LIKE pre-filter skips
+    # non-text rows on part.data first.
     search_text: dict[str, list[tuple[str, str]]] = {}
-    for sid, mid, text in con.execute(
+    for sid, role, text in con.execute(
         """
         SELECT p.session_id,
-               p.message_id,
-               json_extract(p.data, '$.text') AS txt
+               json_extract(m.data, '$.role'),
+               json_extract(p.data, '$.text')
         FROM part p
+        JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
         WHERE p.data LIKE '{"type":"text"%'
           AND p.data NOT LIKE '%"synthetic":true%'
         ORDER BY p.time_created ASC
         """
     ):
-        if not text:
-            continue
-        role = msg_role.get(mid)
-        if role is None:
+        if not text or role not in ("user", "assistant"):
             continue
         search_text.setdefault(sid, []).append((role, text))
 
@@ -670,7 +649,7 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
         "SELECT session_id, role, parts FROM messages ORDER BY created_at ASC"
     ):
         try:
-            p = json.loads(parts)
+            p = stdjson.loads(parts)
         except Exception:
             continue
         if not isinstance(p, list):
@@ -732,11 +711,16 @@ def walk_opencode(cache: dict = None) -> Iterator[Record]:
         seen_sids: set[str] = set()
         try:
             con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA cache_size=-64000")
         except sqlite3.Error as e:
             print(f"opencode: cannot open {db}: {e}", file=sys.stderr)
             continue
+        # Performance PRAGMAs are best-effort on read-only connections.
+        # Some systems (e.g. with FUSE temp dirs) reject these silently.
+        try:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA cache_size=-64000")
+        except sqlite3.Error:
+            pass
         try:
             tables = _opencode_table_set(con)
             if {"session", "message", "part"}.issubset(tables):
@@ -797,7 +781,7 @@ def _read_droid_file(path: Path) -> Optional[Record]:
                 continue
             try:
                 obj = _JSON_LOADS(line)
-            except json.JSONDecodeError:
+            except stdjson.JSONDecodeError:
                 continue
             t = obj.get("type")
             if t == "session_start":
@@ -879,7 +863,7 @@ def _read_pi_file(path: Path) -> Optional[Record]:
                 continue
             try:
                 obj = _JSON_LOADS(line)
-            except json.JSONDecodeError:
+            except stdjson.JSONDecodeError:
                 continue
             t = obj.get("type")
             if t == "session":
@@ -929,6 +913,26 @@ WALKERS = {
 }
 
 
+def _resolve_walker(agent: str):
+    """Resolve a walker function for an agent name.
+
+    Checks built-in WALKERS first, then discovers plugins from
+    the ``stores/`` directory.
+    """
+    w = WALKERS.get(agent)
+    if w is not None:
+        return w
+    # Try plugin discovery
+    try:
+        from stores import discover_stores
+        stores_dir = Path(__file__).resolve().parent / "stores"
+        plugins = discover_stores(stores_dir)
+        return plugins.get(agent)
+    except (ImportError, Exception):
+        pass
+    return None
+
+
 def main() -> int:
     import signal
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
@@ -936,10 +940,11 @@ def main() -> int:
     agents = sys.argv[1:] or list(WALKERS.keys())
     records: list[Record] = []
     if len(agents) > 1 and INDEX_JOBS > 1:
+        from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=len(agents)) as pool:
             future_map = {}
             for a in agents:
-                walker = WALKERS.get(a)
+                walker = _resolve_walker(a)
                 if not walker:
                     print(f"unknown agent: {a}", file=sys.stderr)
                     continue
@@ -952,7 +957,7 @@ def main() -> int:
                     print(f"{a}: {e}", file=sys.stderr)
     else:
         for a in agents:
-            walker = WALKERS.get(a)
+            walker = _resolve_walker(a)
             if not walker:
                 print(f"unknown agent: {a}", file=sys.stderr)
                 continue

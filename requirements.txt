@@ -1,2 +1,2 @@
-# fzf-ai has no external Python dependencies
-# It uses only Python standard library modules
+# fzf-ai dependencies
+orjson>=3.10

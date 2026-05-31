@@ -101,6 +101,7 @@ export FZFAI_INDEX="$INDEX"
 export FZFAI_UI="$UI"
 export FZFAI_AGENTS="${AGENTS[*]:-}"
 export FZFAI_COPY="$COPY"
+export FZFAI_ACTIONS="$SCRIPT_DIR/fzf-ai-actions"
 
 # Preview command: index record passed via positional expansion.
 #   {1}=agent {2}=sid {3}=source {7}=cwd {8}=title
@@ -114,7 +115,7 @@ RELOAD_OPENCODE_CMD=$(quote_cmd "$FZFAI_INDEX" opencode)
 RELOAD_DROID_CMD=$(quote_cmd "$FZFAI_INDEX" droid)
 RELOAD_PI_CMD=$(quote_cmd "$FZFAI_INDEX" pi)
 
-HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-w: wrap  ·  alt-1..5: agent'
+HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  alt-s: star  ·  ctrl-d: delete  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-w: wrap  ·  alt-1..5: agent'
 if [[ -n "$COPY" ]]; then
   HEADER+=$'  ·  ctrl-y: copy id  ·  ctrl-k: copy cmd'
 fi
@@ -224,6 +225,8 @@ FZF_ARGS=(
   --bind='alt->:last'
   --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)"
   --bind="ctrl-e:execute(\${EDITOR:-vi} {3})"
+  --bind="alt-s:execute(\"\$FZFAI_ACTIONS\" star {2} {3})"
+  --bind="ctrl-d:execute(\"\$FZFAI_ACTIONS\" delete {2} {3})"
   --bind="alt-1:change-border-label( fzf-ai · claude )+reload($RELOAD_CLAUDE_CMD)"
   --bind="alt-2:change-border-label( fzf-ai · codex )+reload($RELOAD_CODEX_CMD)"
   --bind="alt-3:change-border-label( fzf-ai · opencode )+reload($RELOAD_OPENCODE_CMD)"

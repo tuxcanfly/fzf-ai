@@ -90,9 +90,12 @@ build_border_label() {
 AGENTS=("$@")
 BORDER_LABEL=$(build_border_label "${AGENTS[@]}")
 STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+CACHE_HOME=${XDG_CACHE_HOME:-$HOME/.cache}
 HISTORY_DIR="$STATE_HOME/fzf-ai"
+SNAPSHOT_DIR="$CACHE_HOME/fzf-ai"
+SNAPSHOT="$SNAPSHOT_DIR/index.tsv"
 HISTORY_FILE="$HISTORY_DIR/query-history"
-mkdir -p "$HISTORY_DIR"
+mkdir -p "$HISTORY_DIR" "$SNAPSHOT_DIR"
 
 # Export the children scripts so fzf bindings can call them.
 export FZFAI_PREVIEW="$PREVIEW"
@@ -119,6 +122,8 @@ HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-
 if [[ -n "$COPY" ]]; then
   HEADER+=$'  ·  ctrl-y: copy id  ·  ctrl-k: copy cmd'
 fi
+HEADER+=$'\nctrl-n/p down/up · ctrl-shift-n/p page down/up · alt-/ scroll preview'
+
 
 # Neutralize user's global FZF_DEFAULT_OPTS so our carefully-tuned
 # flags don't collide with conflicting defaults (e.g. a user-set
@@ -140,12 +145,13 @@ FZF_ARGS=(
   --with-nth='4,5,6,7,8,9'
   --nth='1,4,5,6'
   # Exact matching is the default because the content-scope search
-  # blob (col 9) is a 4000-char concatenation of prompts. Fuzzy
-  # matching against that blob produces a flood of low-signal
-  # "characters-in-order" matches whenever a query shares common
-  # letters with filler text. --exact keeps the picker precise; for
-  # a single fuzzy term, users can still prefix it with ': 'word.
-  --exact
+  # blob (col 9) is now a tight, delimiter-separated list of user
+  # prompts. Fuzzy mode uses a separate token-only snapshot and is
+  # enabled with FZFAI_FUZZY=1 (or toggled later with ctrl-f).
+  # When enabled we drop --exact so fzf uses fuzzy matching against
+  # the distilled token field.
+
+  # --exact is appended below unless FZFAI_FUZZY is set.
   --scheme=history
   --smart-case
   --no-sort
@@ -194,7 +200,7 @@ FZF_ARGS=(
   --header-lines=0
   --preview="$PREVIEW_CMD"
   --preview-label=' Preview '
-  --preview-window='right,60%,border-left,wrap,~4,<120(down,55%,border-top,wrap,~4)'
+  # start: binding is added below depending on snapshot freshness.
   --accept-nth=1,2,3,7
   --expect=enter
   --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload-sync($RELOAD_CMD)"
@@ -226,7 +232,9 @@ FZF_ARGS=(
   --bind="ctrl-o:execute(cwd={7}; case \"\$cwd\" in '~') cwd=\"\$HOME\" ;; '~/'*) cwd=\"\$HOME/\${cwd#\~/}\" ;; esac; cd \"\$cwd\" 2>/dev/null && \$SHELL -i)"
   --bind="ctrl-e:execute(\${EDITOR:-vi} {3})"
   --bind="alt-s:execute(\"\$FZFAI_ACTIONS\" star {2} {3})"
-  --bind="ctrl-d:execute(\"\$FZFAI_ACTIONS\" delete {2} {3})"
+  # ctrl-d: exit when the query is empty (terminal "EOF" gesture), otherwise
+  # delete the selected session.
+  --bind='ctrl-d:transform:[[ -z "$FZF_QUERY" ]] && echo abort || echo execute("$FZFAI_ACTIONS" delete {2} {3})'
   --bind="alt-1:change-border-label( fzf-ai · claude )+reload($RELOAD_CLAUDE_CMD)"
   --bind="alt-2:change-border-label( fzf-ai · codex )+reload($RELOAD_CODEX_CMD)"
   --bind="alt-3:change-border-label( fzf-ai · opencode )+reload($RELOAD_OPENCODE_CMD)"
@@ -243,8 +251,67 @@ if [[ -n "$COPY" ]]; then
     --bind="ctrl-k:execute-silent(\"\$FZFAI_RESUME\" --print-cmd {1} {2} {3} {7} | \$FZFAI_COPY)"
   )
 fi
+# Fuzzy mode uses a separate token-only snapshot and disables --exact.
+FUZZY_MODE=${FZFAI_FUZZY:-0}
+if [[ "$FUZZY_MODE" == "1" ]]; then
+  SNAPSHOT="${SNAPSHOT_DIR}/index.fuzzy.tsv"
+else
+  FZF_ARGS+=(--exact)
+fi
 
-selection=$(fzf "${FZF_ARGS[@]}")
+
+snapshot_age_seconds() {
+  local snap=$1
+  if [[ ! -f "$snap" ]]; then
+    echo 999999
+    return
+  fi
+  local mtime now
+  # Portable mtime in seconds since epoch. Linux stat supports -c %Y;
+  # macOS/BSD does not, so fall back to python3 which we already require.
+  mtime=$(stat -c %Y "$snap" 2>/dev/null) || \
+    mtime=$(python3 -c "import os,sys; print(int(os.path.getmtime(sys.argv[1])))" "$snap" 2>/dev/null)
+  now=$(date +%s)
+  if [[ -z "$mtime" || -z "$now" ]]; then
+    echo 999999
+  else
+    echo $((now - mtime))
+  fi
+}
+
+filter_snapshot() {
+  local snap=$1
+  shift
+  if [[ $# -eq 0 ]]; then
+    cat "$snap"
+    return
+  fi
+  awk -F'\t' -v agents="$*" '
+    BEGIN { split(agents, a, " "); for (i in a) valid[a[i]] = 1 }
+    valid[$1] { print }
+  ' "$snap"
+}
+
+SNAPSHOT_MAX_AGE=${FZFAI_SNAPSHOT_MAX_AGE:-120}
+snapshot_fresh=0
+if [[ -f "$SNAPSHOT" && -z "${FZFAI_FORCE_INDEX:-}" ]]; then
+  age=$(snapshot_age_seconds "$SNAPSHOT")
+  if [[ $age -le $SNAPSHOT_MAX_AGE ]]; then
+    snapshot_fresh=1
+  fi
+fi
+
+if [[ $snapshot_fresh -eq 1 ]]; then
+  FZF_ARGS+=(
+    --bind="start:change-list-label( Loading sessions )+change-footer( Snapshot loaded · ctrl-r to refresh )"
+  )
+  selection=$(filter_snapshot "$SNAPSHOT" "${AGENTS[@]}" | fzf "${FZF_ARGS[@]}")
+else
+  FZF_ARGS+=(
+    --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload-sync($RELOAD_CMD)"
+  )
+  selection=$(fzf "${FZF_ARGS[@]}")
+fi
 fzf_rc=$?
 
 # Exit gracefully on ESC / ctrl-c / no match.

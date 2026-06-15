@@ -14,7 +14,7 @@ class FzfAi < Formula
   def install
     # Install Python dependencies
     system "python3", "-m", "pip", "install", "--prefix=#{prefix}",
-           "orjson", "pygments"
+           "orjson", "pygments", "msgpack"
 
     # Install scripts
     bin.install "bin/fzf-ai"
@@ -25,6 +25,7 @@ class FzfAi < Formula
     bin.install "bin/fzf-ai-actions"
     bin.install "bin/fzf-ai-highlight"
     bin.install "bin/fzf-ai-stats"
+    bin.install "bin/fzf-ai-watch"
     bin.install "bin/version.py"
 
     # Install plugin system

@@ -200,9 +200,44 @@ class TestQueryTerms:
         assert "a" in terms
 
 
+
+class TestHighlightTerms:
+    @pytest.fixture(autouse=True)
+    def _enable_color(self, monkeypatch):
+        monkeypatch.setattr(pv, "NO_COLOR", False)
+
+    def test_highlights_term(self):
+        result = pv.highlight_terms("hello world", ["world"])
+        assert "\033[1;7;33m" in result
+        assert "world" in result
+
+    def test_no_highlight_when_no_terms(self):
+        assert pv.highlight_terms("hello world", []) == "hello world"
+
+    def test_does_not_corrupt_ansi_escapes(self):
+        colored = "\033[31mhello\033[0m world"
+        result = pv.highlight_terms(colored, ["world"])
+        assert colored.replace("world", pv.c("1;7;33", "world")) == result
+        # Make sure the ANSI escape sequences are intact.
+        assert "\033[31m" in result
+        assert "\033[0m" in result
+
+    def test_does_not_match_inside_ansi_escape(self):
+        colored = "\033[31mhello\033[0m"
+        result = pv.highlight_terms(colored, ["31"])
+        # "31" inside the escape sequence should not be highlighted.
+        assert "\033[1;7;33m31\033[0m" not in result
+
+    def test_case_insensitive(self):
+        result = pv.highlight_terms("Hello World", ["world"])
+        assert "World" in pv.strip_ansi(result)
+        assert "\033[" in result
+
+
 # ============================================================================
 # header() rendering tests
 # ============================================================================
+
 
 class TestHeader:
     def test_contains_agent_and_sid(self):

@@ -20,7 +20,7 @@ at the top.
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import as_completed
 import json as stdjson
 import os
 import re
@@ -33,6 +33,9 @@ from typing import Callable, Iterator, Optional
 
 # Fast JSON via orjson (hard dependency). Accepts bytes to skip a decode step.
 import orjson
+
+# Fast binary serialization for the SQLite cache.
+import msgpack
 
 _JSON_LOADS = orjson.loads
 _JSON_DUMPS = orjson.dumps
@@ -51,14 +54,38 @@ _RE_WS_TAB_NL = re.compile(r"[\t\n]+")
 MAX_TITLE = 120
 DISPLAY_CWD = 28
 DISPLAY_TITLE = 72
-# Keep the search blob small so that fuzzy matching stays high-signal.
+# Keep the exact-search blob small so that fuzzy matching stays high-signal.
 # Long soups of text are easy to accidentally match against, which floods
 # the picker with irrelevant rows whenever the query shares common letters
-# with filler content. 1200 chars is enough to hold ~10 distinctive prompt
+# with filler content. 1200 chars is enough to hold ~8-10 distinctive prompt
 # openings per session.
-MAX_SEARCH_BLOB = 4000
+MAX_SEARCH_BLOB = 1200
 MAX_SEARCH_CHUNK = 140  # first part of each message only
 MAX_PROMPTS = 30       # stop collecting search text after this many chunks
+# Fuzzy index: number of distinctive tokens to keep per session.
+MAX_FUZZY_TOKENS = 60
+
+# Common English stopwords; these add no signal in fuzzy mode.
+_STOPWORDS = frozenset({
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "day", "get", "has", "him", "his",
+    "how", "man", "new", "now", "old", "see", "two", "way", "who", "boy",
+    "did", "its", "let", "put", "say", "she", "too", "use", "with", "have",
+    "this", "will", "your", "from", "they", "know", "want", "been", "good",
+    "much", "some", "time", "very", "when", "come", "here", "just", "like",
+    "long", "make", "many", "over", "such", "take", "than", "them", "well",
+    "were", "what", "would", "there", "their", "where", "being", "every",
+    "great", "other", "right", "think", "about", "after", "first", "never",
+    "these", "while", "could", "should", "only", "really", "looking", "need",
+})
+
+# Field delimiter for the exact-search blob. Using a non-printable character
+# prevents fzf from matching query phrases across prompt boundaries.
+_BLOB_DELIM = "\x1f"
+
+# Word tokenizer for fuzzy token extraction.
+_RE_WORD = re.compile(r"[a-zA-Z0-9]+(?:[._+#-][a-zA-Z0-9]+)*")
+
 
 # Colors for the agent tag in the main list (fzf with --ansi renders these).
 _AGENT_COLOR = {
@@ -84,124 +111,161 @@ def colorise(agent: str) -> str:
 
 
 # --------------------------------------------------------------------------
-# Index cache: avoid re-parsing unchanged session files on every startup.
-# Cache is keyed by source path (or "sqlite:<db>" for opencode).
-# Each entry stores the file's mtime + size for validation.
+# Index cache: SQLite-backed incremental cache with msgpack-serialized rows.
+#
+# Each source (session file or sqlite:<db>) maps to one row in the ``sources``
+# table. The row stores mtime/size for freshness checks and a msgpack BLOB of
+# the parsed Record list. This lets us load unchanged sources in milliseconds
+# and only re-parse files that actually changed.
 # --------------------------------------------------------------------------
+CACHE_DB_VERSION = 1
+
+
 def _get_index_cache_path() -> Path:
-    return CACHE_DIR / "index.json"
+    return CACHE_DIR / "index.db"
 
 
-def _load_index_cache() -> dict:
-    path = _get_index_cache_path()
-    if not path.is_file():
-        return {"v": INDEX_CACHE_VERSION, "sources": {}}
-    try:
-        data = _JSON_LOADS(path.read_bytes())
-        if isinstance(data, dict) and data.get("v") == INDEX_CACHE_VERSION:
-            return data
-    except Exception:
-        pass
-    return {"v": INDEX_CACHE_VERSION, "sources": {}}
-
-
-def _save_index_cache(cache: dict) -> None:
+def _open_cache_db() -> sqlite3.Connection:
+    """Open (and initialise) the SQLite cache database."""
     path = _get_index_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    content = _JSON_DUMPS(cache)
-    if isinstance(content, bytes):
-        tmp.write_bytes(content)
-    else:
-        tmp.write_text(content, encoding="utf-8")
-    tmp.rename(path)
+    con = sqlite3.connect(str(path))
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cache_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sources (
+            source TEXT PRIMARY KEY,
+            agent TEXT NOT NULL,
+            mtime REAL NOT NULL,
+            size INTEGER NOT NULL,
+            data BLOB NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_sources_agent ON sources(agent)")
+    con.execute(
+        "INSERT OR REPLACE INTO cache_meta (key, value) VALUES ('v', ?)",
+        (str(CACHE_DB_VERSION),),
+    )
+    con.commit()
+    return con
 
 
-def _validate_cache_entry(entry: dict) -> bool:
-    """Check if a cache entry is still valid (file exists, mtime+size unchanged)."""
-    src = entry.get("source", "")
-    if src.startswith("sqlite:"):
-        db_path = Path(src[len("sqlite:"):])
-        return db_path.is_file() and db_path.stat().st_mtime == entry.get("mtime", 0)
-    p = Path(src)
+def _record_to_dict(r: Record) -> dict:
+    return {
+        "agent": r.agent,
+        "session_id": r.session_id,
+        "source": r.source,
+        "updated": r.updated,
+        "msgs": r.msgs,
+        "cwd": r.cwd,
+        "title": r.title,
+        "prompts": r.prompts,
+        "user_prompts": r.user_prompts,
+    }
+
+
+def _record_from_dict(d: dict) -> Record:
+    return Record(
+        agent=d.get("agent", ""),
+        session_id=d.get("session_id", ""),
+        source=d.get("source", ""),
+        updated=d.get("updated", 0.0),
+        msgs=d.get("msgs", 0),
+        cwd=d.get("cwd", ""),
+        title=d.get("title", ""),
+        prompts=d.get("prompts", []),
+        user_prompts=d.get("user_prompts", []),
+    )
+
+
+def _source_is_fresh(con: sqlite3.Connection, source: str) -> bool:
+    """Return True if the cached row for source matches the current file metadata."""
+    cur = con.execute("SELECT mtime, size FROM sources WHERE source = ?", (source,))
+    row = cur.fetchone()
+    if row is None:
+        return False
+    mtime, size = row
+    if source.startswith("sqlite:"):
+        db_path = Path(source[len("sqlite:"):])
+        return db_path.is_file() and db_path.stat().st_mtime == mtime
+    p = Path(source)
     if not p.is_file():
         return False
     try:
         st = p.stat()
-        return st.st_mtime == entry.get("mtime", 0) and st.st_size == entry.get("size", 0)
+        return st.st_mtime == mtime and st.st_size == size
     except OSError:
         return False
 
 
-def _file_cache_entry(path: Path, records: list[Record]) -> dict:
-    """Build a cache entry from a file path and its parsed records."""
+def _load_cached_records(con: sqlite3.Connection, source: str) -> list[Record]:
+    """Load and deserialize cached records for a source."""
+    cur = con.execute("SELECT data FROM sources WHERE source = ?", (source,))
+    row = cur.fetchone()
+    if row is None:
+        return []
     try:
-        st = path.stat()
-        mtime, size = st.st_mtime, st.st_size
-    except OSError:
-        mtime, size = 0.0, 0
-    return {
-        "mtime": mtime,
-        "size": size,
-        "source": str(path),
-        "records": [
-            {
-                "agent": r.agent,
-                "session_id": r.session_id,
-                "source": r.source,
-                "updated": r.updated,
-                "msgs": r.msgs,
-                "cwd": r.cwd,
-                "title": r.title,
-                "prompts": r.prompts,
-            }
-            for r in records
-        ],
-    }
+        records_data = msgpack.unpackb(row[0], raw=False)
+        if isinstance(records_data, list):
+            return [_record_from_dict(d) for d in records_data]
+    except Exception:
+        pass
+    return []
 
 
-def _db_cache_entry(db: Path, records: list[Record]) -> dict:
-    """Build a cache entry from a database path and its parsed records."""
-    try:
-        mtime = db.stat().st_mtime
-    except OSError:
-        mtime = 0.0
-    return {
-        "mtime": mtime,
-        "size": 0,
-        "source": f"sqlite:{db}",
-        "records": [
-            {
-                "agent": r.agent,
-                "session_id": r.session_id,
-                "source": r.source,
-                "updated": r.updated,
-                "msgs": r.msgs,
-                "cwd": r.cwd,
-                "title": r.title,
-                "prompts": r.prompts,
-            }
-            for r in records
-        ],
-    }
+def _upsert_source_records(
+    con: sqlite3.Connection,
+    agent: str,
+    source: str,
+    path_or_db: Path,
+    records: list[Record],
+) -> None:
+    """Store parsed records for a source, keyed by its current mtime/size."""
+    if source.startswith("sqlite:"):
+        try:
+            mtime = path_or_db.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        size = 0
+    else:
+        try:
+            st = path_or_db.stat()
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:
+            mtime, size = 0.0, 0
+    data = msgpack.packb([_record_to_dict(r) for r in records], use_bin_type=True)
+    con.execute(
+        """
+        INSERT OR REPLACE INTO sources (source, agent, mtime, size, data)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (source, agent, mtime, size, data),
+    )
 
 
-def _records_from_cache_entry(entry: dict) -> list[Record]:
-    """Reconstruct Record objects from a cache entry."""
-    records = []
-    for d in entry.get("records", []):
-        r = Record(
-            agent=d.get("agent", ""),
-            session_id=d.get("session_id", ""),
-            source=d.get("source", ""),
-            updated=d.get("updated", 0.0),
-            msgs=d.get("msgs", 0),
-            cwd=d.get("cwd", ""),
-            title=d.get("title", ""),
-            prompts=d.get("prompts", []),
+def _delete_stale_agent_sources(
+    con: sqlite3.Connection, agent: str, keep: set[str]
+) -> None:
+    """Remove cached sources for an agent that no longer exist on disk."""
+    if not keep:
+        con.execute("DELETE FROM sources WHERE agent = ?", (agent,))
+        return
+    # SQLite has a limit on host parameters; delete in batches.
+    batch = 900
+    kept = list(keep)
+    for i in range(0, len(kept), batch):
+        chunk = kept[i : i + batch]
+        placeholders = ",".join("?" * len(chunk))
+        con.execute(
+            f"DELETE FROM sources WHERE agent = ? AND source NOT IN ({placeholders})",
+            (agent, *chunk),
         )
-        records.append(r)
-    return records
 
 
 def _collect_jsonl_paths(root: Path, glob_pat: str = "*.jsonl") -> list[Path]:
@@ -227,25 +291,48 @@ class Record:
     title: str = ""
     prompts: list = field(default_factory=list)
     _prompt_set: set = field(default_factory=set)
+    user_prompts: list = field(default_factory=list)
+    _user_prompt_set: set = field(default_factory=set)
 
-    def add_search_text(self, text: str) -> None:
+    def _add_search_text_internal(self, text: str, prompt_list: list, prompt_set: set) -> None:
         # Clip before cleaning so the regex sub only walks ~140 chars
         # instead of potentially megabytes of assistant output.
         t = clean(text[: MAX_SEARCH_CHUNK * 2])[:MAX_SEARCH_CHUNK]
-        if not t or t in self._prompt_set:
+        if not t or t in prompt_set:
             return
         for prefix in _SEARCH_NOISE_PREFIXES:
             if t.startswith(prefix):
                 return
-        self._prompt_set.add(t)
-        self.prompts.append(t)
+        prompt_set.add(t)
+        prompt_list.append(t)
+
+    def add_search_text(self, text: str) -> None:
+        """Add assistant/tool text to the general search index."""
+        self._add_search_text_internal(text, self.prompts, self._prompt_set)
 
     def add_prompt(self, text: str) -> None:
+        """Add a real user prompt; also feeds the user-prompt index."""
         if not is_real_prompt(text):
             return
         self.add_search_text(text)
+        self._add_search_text_internal(text, self.user_prompts, self._user_prompt_set)
 
-    def as_row(self) -> str:
+    def fuzzy_blob(self) -> str:
+        """Distinctive tokens from user prompts, tuned for fzf fuzzy mode."""
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for p in self.user_prompts:
+            for m in _RE_WORD.finditer(p):
+                word = m.group(0).lower()
+                if len(word) < 3 or word in _STOPWORDS or word in seen:
+                    continue
+                seen.add(word)
+                tokens.append(word)
+                if len(tokens) >= MAX_FUZZY_TOKENS:
+                    return " ".join(tokens)
+        return " ".join(tokens)
+
+    def as_row(self, mode: str = "exact") -> str:
         iso = (
             datetime.fromtimestamp(self.updated, tz=timezone.utc)
             .strftime("%Y-%m-%d %H:%M")
@@ -257,8 +344,11 @@ class Record:
         if cwd.startswith(HOME_STR):
             cwd = "~" + cwd[len(HOME_STR):]
         cwd = display_text(cwd, DISPLAY_CWD)
-        blob = " · ".join(self.prompts)
-        blob = _RE_WS_TAB_NL.sub(" ", blob)[:MAX_SEARCH_BLOB]
+        if mode == "exact":
+            blob = _BLOB_DELIM.join(self.user_prompts)
+            blob = blob[:MAX_SEARCH_BLOB]
+        else:
+            blob = self.fuzzy_blob()
         return "\t".join(
             [
                 self.agent,
@@ -363,7 +453,13 @@ def _parallel_read(
                 print(f"{label}: {path}: {e}", file=sys.stderr)
         return
 
-    with ProcessPoolExecutor(max_workers=min(INDEX_JOBS, len(paths))) as pool:
+    # Use threads rather than processes so we do not inherit SQLite file
+    # descriptors across fork(). The work is I/O-bound and orjson releases
+    # the GIL during parsing, so threads are nearly as fast here and avoid
+    # the "database is locked" issues that come with fork + WAL.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=min(INDEX_JOBS, len(paths))) as pool:
         futures = {pool.submit(reader, path): path for path in paths}
         for future in as_completed(futures):
             path = futures[future]
@@ -378,19 +474,28 @@ def _parallel_read(
 # --------------------------------------------------------------------------
 # Claude Code  -- ~/.claude/projects/<enc-cwd>/<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_claude(cache: dict = None) -> Iterator[Record]:
+def walk_claude(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
     root = HOME / ".claude" / "projects"
-    sources = cache.get("sources", {}) if cache else {}
-    uncached_paths: list[Path] = []
-    for path in _collect_jsonl_paths(root):
-        entry = sources.get(str(path))
-        if entry and _validate_cache_entry(entry):
-            yield from _records_from_cache_entry(entry)
-        else:
-            uncached_paths.append(path)
-    for rec in _parallel_read(uncached_paths, _read_claude_file, "claude"):
-        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
-        yield rec
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        uncached_paths: list[Path] = []
+        for path in _collect_jsonl_paths(root):
+            source = str(path)
+            current_sources.add(source)
+            if _source_is_fresh(con, source):
+                yield from _load_cached_records(con, source)
+            else:
+                uncached_paths.append(path)
+        for rec in _parallel_read(uncached_paths, _read_claude_file, "claude"):
+            _upsert_source_records(con, "claude", rec.source, Path(rec.source), [rec])
+            yield rec
+        _delete_stale_agent_sources(con, "claude", current_sources)
+        con.commit()
+    finally:
+        if own_con:
+            con.close()
 
 
 def _read_claude_file(path: Path) -> Optional[Record]:
@@ -454,19 +559,28 @@ def _read_claude_file(path: Path) -> Optional[Record]:
 # --------------------------------------------------------------------------
 # Codex  -- ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_codex(cache: dict = None) -> Iterator[Record]:
+def walk_codex(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
     root = HOME / ".codex" / "sessions"
-    sources = cache.get("sources", {}) if cache else {}
-    uncached_paths: list[Path] = []
-    for path in root.rglob("rollout-*.jsonl"):
-        entry = sources.get(str(path))
-        if entry and _validate_cache_entry(entry):
-            yield from _records_from_cache_entry(entry)
-        else:
-            uncached_paths.append(path)
-    for rec in _parallel_read(uncached_paths, _read_codex_file, "codex"):
-        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
-        yield rec
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        uncached_paths: list[Path] = []
+        for path in root.rglob("rollout-*.jsonl"):
+            source = str(path)
+            current_sources.add(source)
+            if _source_is_fresh(con, source):
+                yield from _load_cached_records(con, source)
+            else:
+                uncached_paths.append(path)
+        for rec in _parallel_read(uncached_paths, _read_codex_file, "codex"):
+            _upsert_source_records(con, "codex", rec.source, Path(rec.source), [rec])
+            yield rec
+        _delete_stale_agent_sources(con, "codex", current_sources)
+        con.commit()
+    finally:
+        if own_con:
+            con.close()
 
 
 def _read_codex_file(path: Path) -> Optional[Record]:
@@ -699,66 +813,83 @@ def _opencode_walk_legacy(con: sqlite3.Connection, db: Path) -> Iterator[Record]
         yield rec
 
 
-def walk_opencode(cache: dict = None) -> Iterator[Record]:
-    sources = cache.get("sources", {}) if cache else {}
-    for db in _opencode_db_paths():
-        src_key = f"sqlite:{db}"
-        entry = sources.get(src_key)
-        if entry and _validate_cache_entry(entry):
-            yield from _records_from_cache_entry(entry)
-            continue
-        records: list[Record] = []
-        seen_sids: set[str] = set()
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-        except sqlite3.Error as e:
-            print(f"opencode: cannot open {db}: {e}", file=sys.stderr)
-            continue
-        # Performance PRAGMAs are best-effort on read-only connections.
-        # Some systems (e.g. with FUSE temp dirs) reject these silently.
-        try:
-            con.execute("PRAGMA journal_mode=WAL")
-            con.execute("PRAGMA cache_size=-64000")
-        except sqlite3.Error:
-            pass
-        try:
-            tables = _opencode_table_set(con)
-            if {"session", "message", "part"}.issubset(tables):
-                walker = _opencode_walk_current(con, db)
-            elif {"sessions", "messages"}.issubset(tables):
-                walker = _opencode_walk_legacy(con, db)
-            else:
+def walk_opencode(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        for db in _opencode_db_paths():
+            src_key = f"sqlite:{db}"
+            current_sources.add(src_key)
+            if _source_is_fresh(con, src_key):
+                yield from _load_cached_records(con, src_key)
                 continue
-            for rec in walker:
-                if rec.session_id in seen_sids:
+            records: list[Record] = []
+            seen_sids: set[str] = set()
+            try:
+                dbcon = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            except sqlite3.Error as e:
+                print(f"opencode: cannot open {db}: {e}", file=sys.stderr)
+                continue
+            # Performance PRAGMAs are best-effort on read-only connections.
+            # Some systems (e.g. with FUSE temp dirs) reject these silently.
+            try:
+                dbcon.execute("PRAGMA journal_mode=WAL")
+                dbcon.execute("PRAGMA cache_size=-64000")
+            except sqlite3.Error:
+                pass
+            try:
+                tables = _opencode_table_set(dbcon)
+                if {"session", "message", "part"}.issubset(tables):
+                    walker = _opencode_walk_current(dbcon, db)
+                elif {"sessions", "messages"}.issubset(tables):
+                    walker = _opencode_walk_legacy(dbcon, db)
+                else:
                     continue
-                seen_sids.add(rec.session_id)
-                records.append(rec)
-                yield rec
-        except sqlite3.Error as e:
-            print(f"opencode: {db}: {e}", file=sys.stderr)
-        finally:
+                for rec in walker:
+                    if rec.session_id in seen_sids:
+                        continue
+                    seen_sids.add(rec.session_id)
+                    records.append(rec)
+                    yield rec
+            except sqlite3.Error as e:
+                print(f"opencode: {db}: {e}", file=sys.stderr)
+            finally:
+                dbcon.close()
+            if records:
+                _upsert_source_records(con, "opencode", src_key, db, records)
+        _delete_stale_agent_sources(con, "opencode", current_sources)
+        con.commit()
+    finally:
+        if own_con:
             con.close()
-        if records:
-            sources[src_key] = _db_cache_entry(db, records)
 
 
 # --------------------------------------------------------------------------
 # Droid / Factory -- ~/.factory/sessions/<proj>/<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_droid(cache: dict = None) -> Iterator[Record]:
+def walk_droid(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
     root = HOME / ".factory" / "sessions"
-    sources = cache.get("sources", {}) if cache else {}
-    uncached_paths: list[Path] = []
-    for path in _collect_jsonl_paths(root):
-        entry = sources.get(str(path))
-        if entry and _validate_cache_entry(entry):
-            yield from _records_from_cache_entry(entry)
-        else:
-            uncached_paths.append(path)
-    for rec in _parallel_read(uncached_paths, _read_droid_file, "droid"):
-        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
-        yield rec
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        uncached_paths: list[Path] = []
+        for path in _collect_jsonl_paths(root):
+            source = str(path)
+            current_sources.add(source)
+            if _source_is_fresh(con, source):
+                yield from _load_cached_records(con, source)
+            else:
+                uncached_paths.append(path)
+        for rec in _parallel_read(uncached_paths, _read_droid_file, "droid"):
+            _upsert_source_records(con, "droid", rec.source, Path(rec.source), [rec])
+            yield rec
+        _delete_stale_agent_sources(con, "droid", current_sources)
+        con.commit()
+    finally:
+        if own_con:
+            con.close()
 
 
 def _read_droid_file(path: Path) -> Optional[Record]:
@@ -824,19 +955,28 @@ def _read_droid_file(path: Path) -> Optional[Record]:
 # --------------------------------------------------------------------------
 # pi  -- ~/.pi/agent/sessions/<enc-cwd>/<iso>_<uuid>.jsonl
 # --------------------------------------------------------------------------
-def walk_pi(cache: dict = None) -> Iterator[Record]:
+def walk_pi(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
     root = HOME / ".pi" / "agent" / "sessions"
-    sources = cache.get("sources", {}) if cache else {}
-    uncached_paths: list[Path] = []
-    for path in _collect_jsonl_paths(root):
-        entry = sources.get(str(path))
-        if entry and _validate_cache_entry(entry):
-            yield from _records_from_cache_entry(entry)
-        else:
-            uncached_paths.append(path)
-    for rec in _parallel_read(uncached_paths, _read_pi_file, "pi"):
-        sources[str(rec.source)] = _file_cache_entry(Path(rec.source), [rec])
-        yield rec
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        uncached_paths: list[Path] = []
+        for path in _collect_jsonl_paths(root):
+            source = str(path)
+            current_sources.add(source)
+            if _source_is_fresh(con, source):
+                yield from _load_cached_records(con, source)
+            else:
+                uncached_paths.append(path)
+        for rec in _parallel_read(uncached_paths, _read_pi_file, "pi"):
+            _upsert_source_records(con, "pi", rec.source, Path(rec.source), [rec])
+            yield rec
+        _delete_stale_agent_sources(con, "pi", current_sources)
+        con.commit()
+    finally:
+        if own_con:
+            con.close()
 
 
 def _read_pi_file(path: Path) -> Optional[Record]:
@@ -933,48 +1073,76 @@ def _resolve_walker(agent: str):
     return None
 
 
+
+def _get_snapshot_path(mode: str = "exact") -> Path:
+    if mode == "exact":
+        return CACHE_DIR / "index.tsv"
+    return CACHE_DIR / "index.fuzzy.tsv"
+
+
+def _write_snapshot(records: list[Record], mode: str = "exact") -> None:
+    """Write a hot TSV snapshot for fzf-ai to load without reindexing."""
+    path = _get_snapshot_path(mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    rows = "\n".join(r.as_row(mode=mode) for r in records)
+    tmp.write_text(rows + "\n" if rows else "", encoding="utf-8")
+    tmp.rename(path)
+
+
+def _write_all_snapshots(records: list[Record]) -> None:
+    """Write both exact and fuzzy hot snapshots."""
+    _write_snapshot(records, mode="exact")
+    _write_snapshot(records, mode="fuzzy")
+
+
 def main() -> int:
     import signal
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    cache = _load_index_cache()
+    cache_con = _open_cache_db()
     agents = sys.argv[1:] or list(WALKERS.keys())
     records: list[Record] = []
-    if len(agents) > 1 and INDEX_JOBS > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(agents)) as pool:
-            future_map = {}
+    try:
+        if len(agents) > 1 and INDEX_JOBS > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=len(agents)) as pool:
+                future_map = {}
+                for a in agents:
+                    walker = _resolve_walker(a)
+                    if not walker:
+                        print(f"unknown agent: {a}", file=sys.stderr)
+                        continue
+                    # Each thread gets its own SQLite connection to avoid
+                    # sharing connections across threads.
+                    future_map[pool.submit(lambda w: list(w(None)), walker)] = a
+                for future in as_completed(future_map):
+                    a = future_map[future]
+                    try:
+                        records.extend(future.result())
+                    except Exception as e:
+                        print(f"{a}: {e}", file=sys.stderr)
+        else:
             for a in agents:
                 walker = _resolve_walker(a)
                 if not walker:
                     print(f"unknown agent: {a}", file=sys.stderr)
                     continue
-                future_map[pool.submit(lambda w: list(w(cache)), walker)] = a
-            for future in as_completed(future_map):
-                a = future_map[future]
                 try:
-                    records.extend(future.result())
+                    records.extend(walker(cache_con))
                 except Exception as e:
                     print(f"{a}: {e}", file=sys.stderr)
-    else:
-        for a in agents:
-            walker = _resolve_walker(a)
-            if not walker:
-                print(f"unknown agent: {a}", file=sys.stderr)
-                continue
-            try:
-                records.extend(walker(cache))
-            except Exception as e:
-                print(f"{a}: {e}", file=sys.stderr)
-    try:
-        _save_index_cache(cache)
+        cache_con.commit()
     except Exception:
         pass
+    finally:
+        cache_con.close()
     records.sort(key=lambda r: r.updated, reverse=True)
     # One big write is a touch faster and, more importantly, atomic: fzf
     # won't see partially-written rows if the caller redirects to a pipe.
     sys.stdout.write("\n".join(r.as_row() for r in records))
     if records:
         sys.stdout.write("\n")
+    _write_all_snapshots(records)
     return 0
 
 

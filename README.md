@@ -30,13 +30,17 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
   reasoning, model, cwd). Boilerplate environment / policy blocks are
   hidden from the preview when possible.
 * **Smart-case exact matching by default** across agent / cwd / title /
-  hidden session content snippets. `--exact` keeps matches high-signal
-  because the hidden content blob is a 4000-char concatenation of
-  prompts where fuzzy matching would otherwise flood the picker with
-  incidental letter-order hits. Recency breaks ties via
+  hidden session content. `--exact` keeps matches high-signal because the
+  hidden content blob is now a tight, unit-separated concatenation of user
+  prompts (≈1200 chars) where fuzzy matching would otherwise flood the
+  picker with incidental letter-order hits. Recency breaks ties via
   `--scheme=history` + `--tiebreak=index`. Prefix a word with `'` to
   fuzzy-match that term, `!word` to exclude, `^word` / `word$` to
   anchor, or `a | b` for OR.
+* **Fuzzy mode**: set `FZFAI_FUZZY=1` (or run `fzf-ai` with that env var)
+  to load a separate token-only snapshot and disable `--exact`. The fuzzy
+  index keeps only distinctive, stopword-filtered tokens from user prompts,
+  so it is fast and high-signal without the usual filler-text noise.
 * Uses newer `fzf` features to make the picker behave like a small TUI:
    * `reload-sync` for clean initial load and reindex without flicker
    * `change-nth` + `FZF_NTH` to switch search scopes on the fly
@@ -48,8 +52,7 @@ Fuzzy-find and resume any AI coding session across **claude-code**, **codex**,
    * `--id-nth` for cross-reload tracking by session identity
    * `--cycle` for wrap-around list navigation
    * `--keep-right` so the title field stays visible on long rows
-   * `--exact` + `--scheme=history` + `--tiebreak=index` so matches are
-     literal (precise) and recency wins ties
+   * `--exact` by default, with `FZFAI_FUZZY=1` for token-based fuzzy search
    * `--smart-case` so queries only become case-sensitive when you type
      an uppercase letter
    * `--accept-nth` for clean output parsing without visible fields leaking
@@ -123,6 +126,35 @@ The indexer reads session stores in parallel across agents and within each
 agent. Set `FZFAI_INDEX_JOBS=<n>` to override the per-agent worker count.
 The default is `min(32, cpu_count + 4)`.
 
+### Hot snapshot
+
+`fzf-ai-index` and `fzf-ai-watch` write a hot TSV snapshot to
+`~/.cache/fzf-ai/index.tsv` (and `index.fuzzy.tsv` for fuzzy mode). When the
+snapshot is fresh, `fzf-ai` loads it directly instead of re-running the
+indexer, so warm starts are effectively a single file read. The default
+maximum snapshot age is 120 seconds; override with `FZFAI_SNAPSHOT_MAX_AGE`.
+Set `FZFAI_FORCE_INDEX=1` to skip the snapshot and reindex on demand.
+
+### Background incremental indexer
+
+`fzf-ai-index` keeps an incremental SQLite cache at
+`~/.cache/fzf-ai/index.db`. Each session source is stored as a msgpack BLOB
+keyed by `mtime`/`size`, so unchanged files are loaded from the cache instead
+of being re-parsed. On a warm cache, startup is typically **10–50x faster**.
+
+The watcher also refreshes the hot snapshot after every update, so `fzf-ai`
+starts instantly when the watcher is running.
+
+To keep the cache hot in the background, run the watcher:
+
+```bash
+fzf-ai-watch              # watch all agents
+fzf-ai-watch claude codex # watch only these agents
+```
+
+Set `FZFAI_WATCH_INTERVAL=<seconds>` to change the poll interval (default 60).
+The watcher exits cleanly on `SIGINT`/`SIGTERM`.
+
 ## PyPI Publishing
 
 GitHub Actions trusted publishing is configured in
@@ -160,22 +192,37 @@ fzf-ai claude codex       # only these agents
 
 ### Search syntax (exact smart-case by default)
 
+Exact mode is the default. Set `FZFAI_FUZZY=1` to switch to a token-based
+fuzzy index where every term is fuzzy-matched automatically.
+
 | query             | meaning                                    |
 |-------------------|--------------------------------------------|
 | `noita`           | contains `noita`                           |
 | `noita webgpu`    | contains `noita` AND contains `webgpu`     |
-| `'word`           | fuzzy-match for this term (unquote)        |
+| `'word`           | fuzzy-match for this term in exact mode    |
 | `^use`            | starts with `use`                          |
 | `.md$`            | ends with `.md`                            |
 | `!draft`          | excludes items containing `draft`          |
-| `a | b | c`       | OR                                         |
+| `a \| b \| c`     | OR                                         |
 
 Queries are case-insensitive until you type an uppercase letter
 (`--smart-case`). Sessions are pre-sorted by last-modified time and
 `--tiebreak=index` preserves that order when match scores are equal.
-The default is `--exact` because the hidden content blob is long
-enough that fuzzy matching tends to return unrelated sessions whose
-letters happen to appear in the right order.
+The default is `--exact` because the hidden content blob is a tight
+concatenation of user prompts; fuzzy matching against raw assistant text
+would otherwise return unrelated sessions whose letters happen to appear in
+the right order.
+
+### Fuzzy mode
+
+```bash
+export FZFAI_FUZZY=1
+fzf-ai
+```
+
+In fuzzy mode the content field contains only distinctive, stopword-filtered
+tokens extracted from user prompts, so fuzzy matching stays high-signal and
+fast. The snapshot used is `~/.cache/fzf-ai/index.fuzzy.tsv`.
 
 ### Keys
 
@@ -233,6 +280,7 @@ fzf's `{*f}` placeholder. It shows:
 ```
 bin/fzf-ai            ─ bash launcher wiring advanced fzf bindings
 bin/fzf-ai-index      ─ python: walks every session store, emits 9-col TSV
+bin/fzf-ai-watch      ─ python: background indexer that keeps the SQLite cache hot
 bin/fzf-ai-preview    ─ python: renders a conversation preview for fzf
 bin/fzf-ai-resume     ─ bash:   cd into cwd and exec the right AI CLI
 bin/fzf-ai-ui         ─ bash:   dynamic labels / scope switching / footer stats
@@ -244,9 +292,12 @@ The index format (TAB-separated):
 1 agent(raw)   2 session_id   3 source      ← hidden, machine only
 4 agent(ui)    5 updated      6 msgs        ← visible, padded + ANSI
 7 cwd          8 title                       ← visible
-9 search blob (hidden session content)      ← pushed past the right edge,
+9 search blob (user prompts, unit-separated) ← pushed past the right edge,
                                                used for content search only
 ```
+
+A second snapshot, `index.fuzzy.tsv`, replaces column 9 with stopword-filtered
+tokens for use when `FZFAI_FUZZY=1`.
 
 fzf runs with:
 
@@ -341,11 +392,17 @@ def walk(cache: dict | None = None):
 
 Then run: `fzf-ai copilot`
 
-### Syntax-highlighted preview
+### Rich preview
 
-The preview window now highlights code blocks using **Pygments** with the
-Monokai colour scheme. Any fenced code block (\`\`\`python, \`\`\`js, …) in a
-session message is rendered with syntax-coloured ANSI output.
+The preview window renders the conversation with:
+
+* **Syntax highlighting** for fenced code blocks using **Pygments** with the
+  Monokai colour scheme.
+* **Keyword highlighting**: query terms are highlighted in the preview text
+  without corrupting existing ANSI escapes from Pygments or role colours.
+* **Tool calls and file edits** for Claude sessions, shown as compact
+  `⟨tool:name⟩`, `⟨create⟩ path`, `⟨update⟩ path`, and `⟨edit⟩ path` summaries
+  so you can see what the agent actually did.
 
 ## Performance
 

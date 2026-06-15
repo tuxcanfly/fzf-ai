@@ -31,7 +31,7 @@ setup(
     packages=[],  # We're installing scripts directly, not Python packages
     include_package_data=True,
     python_requires=">=3.10",
-    install_requires=["orjson>=3.10"],
+    install_requires=["orjson>=3.10", "msgpack>=1.0"],
     extras_require={},
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -56,13 +56,14 @@ setup(
     data_files=[
         ('bin', [
             'bin/fzf-ai',
-            'bin/fzf-ai-index', 
+            'bin/fzf-ai-index',
             'bin/fzf-ai-preview',
             'bin/fzf-ai-resume',
             'bin/fzf-ai-ui',
             'bin/fzf-ai-actions',
             'bin/fzf-ai-highlight',
             'bin/fzf-ai-stats',
+            'bin/fzf-ai-watch',
         ]),
         ('bin/stores', [
             'bin/stores/__init__.py',

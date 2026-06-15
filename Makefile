@@ -10,7 +10,7 @@ install-pip:  ## Install using pip
 
 install-symlink:  ## Install by symlinking to ~/.local/bin (traditional method)
 	@mkdir -p ~/.local/bin
-	@for script in bin/fzf-ai bin/fzf-ai-index bin/fzf-ai-preview bin/fzf-ai-resume bin/fzf-ai-ui bin/fzf-ai-actions bin/fzf-ai-highlight bin/fzf-ai-stats; do \
+	@for script in bin/fzf-ai bin/fzf-ai-index bin/fzf-ai-preview bin/fzf-ai-resume bin/fzf-ai-ui bin/fzf-ai-actions bin/fzf-ai-highlight bin/fzf-ai-stats bin/fzf-ai-watch; do \
 		if [ -f "$$script" ]; then \
 			echo "Linking $$script to ~/.local/bin/"; \
 			ln -sf "$$(pwd)/$$script" ~/.local/bin/; \
@@ -34,7 +34,7 @@ test:  ## Run basic tests
 
 clean:  ## Clean up installation
 	@echo "Removing symlinks..."
-	@for script in fzf-ai fzf-ai-index fzf-ai-preview fzf-ai-resume fzf-ai-ui fzf-ai-actions fzf-ai-highlight fzf-ai-stats; do \
+	@for script in fzf-ai fzf-ai-index fzf-ai-preview fzf-ai-resume fzf-ai-ui fzf-ai-actions fzf-ai-highlight fzf-ai-stats fzf-ai-watch; do \
 		if [ -L "$$HOME/.local/bin/$$script" ]; then \
 			rm -f "$$HOME/.local/bin/$$script"; \
 			echo "Removed $$HOME/.local/bin/$$script"; \

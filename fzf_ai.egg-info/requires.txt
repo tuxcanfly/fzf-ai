@@ -1,3 +1,2 @@
-
-[fast]
-orjson
+orjson>=3.10
+msgpack>=1.0

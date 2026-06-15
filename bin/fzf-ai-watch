@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""fzf-ai-watch: background indexer that keeps the SQLite cache hot.
+
+Runs an incremental index update in a loop so that `fzf-ai` startup is
+near-instant. By default it wakes every 60 seconds; override with
+``FZFAI_WATCH_INTERVAL`` (seconds). Sends a single update immediately on
+start, then sleeps.
+
+Usage:
+    fzf-ai-watch              # watch all agents
+    fzf-ai-watch claude codex # watch only these agents
+
+Exit cleanly with SIGINT or SIGTERM.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import signal
+import sys
+import time
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+# Load the indexer script as a module even though its filename contains a hyphen.
+# In tests it may already be imported via a symlink, in which case we reuse it.
+if "fzf_ai_index" in sys.modules:
+    _idx_module = sys.modules["fzf_ai_index"]
+else:
+    # spec_from_file_location cannot infer a loader for a no-extension file, so
+    # we use SourceFileLoader explicitly.
+    _idx_loader = SourceFileLoader("fzf_ai_index", str(SCRIPT_DIR / "fzf-ai-index"))
+    _idx_spec = importlib.util.spec_from_loader("fzf_ai_index", _idx_loader)
+    _idx_module = importlib.util.module_from_spec(_idx_spec)
+    sys.modules["fzf_ai_index"] = _idx_module
+    _idx_spec.loader.exec_module(_idx_module)
+
+WATCH_INTERVAL = max(1, int(os.environ.get("FZFAI_WATCH_INTERVAL", "60")))
+
+
+def _run_update(agents: list[str]) -> None:
+    """Refresh the cache for the given agents and write a hot TSV snapshot."""
+    con = _idx_module._open_cache_db()
+    records: list = []
+    try:
+        for agent in agents:
+            walker = _idx_module._resolve_walker(agent)
+            if not walker:
+                print(f"fzf-ai-watch: unknown agent: {agent}", file=sys.stderr)
+                continue
+            try:
+                # Exhaust the generator so all records are cached.
+                agent_records = list(walker(con))
+                records.extend(agent_records)
+            except Exception as e:
+                print(f"fzf-ai-watch: {agent}: {e}", file=sys.stderr)
+        con.commit()
+        try:
+            _idx_module._write_all_snapshots(records)
+        except Exception as e:
+            print(f"fzf-ai-watch: snapshot: {e}", file=sys.stderr)
+    finally:
+        con.close()
+
+
+def main() -> int:
+    agents = sys.argv[1:] or list(_idx_module.WALKERS.keys())
+
+    stop = False
+
+    def _on_signal(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    # First pass runs immediately.
+    _run_update(agents)
+
+    while not stop:
+        # Sleep in small chunks so we respond promptly to signals.
+        for _ in range(WATCH_INTERVAL):
+            if stop:
+                break
+            time.sleep(1)
+        if not stop:
+            _run_update(agents)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

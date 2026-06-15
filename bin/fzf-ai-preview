@@ -275,18 +275,26 @@ def message_matches(text: str, terms: list[str]) -> bool:
     return any(term in haystack for term in terms)
 
 
+_ANSI_ESCAPE_RE = re.compile(r"(\033\[[0-9;]*m)")
+
+
 def highlight_terms(text: str, terms: list[str]) -> str:
     if NO_COLOR or not terms:
         return text
-    out = text
-    for term in terms:
-        out = re.sub(
-            re.escape(term),
-            lambda m: c("30;43", m.group(0)),
-            out,
-            flags=re.IGNORECASE,
-        )
-    return out
+    pattern = re.compile("|".join(re.escape(t) for t in terms), re.IGNORECASE)
+    parts: list[str] = []
+    for segment in _ANSI_ESCAPE_RE.split(text):
+        if not segment:
+            continue
+        if _ANSI_ESCAPE_RE.match(segment):
+            parts.append(segment)
+        else:
+            parts.append(pattern.sub(lambda m: c("1;7;33", m.group(0)), segment))
+    return "".join(parts)
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 def is_noise_message(role: str, text: str) -> bool:
@@ -400,6 +408,29 @@ def extract_text(parts):
     return str(parts)
 
 
+def _claude_event_text(obj: dict) -> str:
+    """Summarize Claude top-level events that are not regular messages."""
+    t = obj.get("type")
+    if t == "tool_use":
+        name = obj.get("name", "tool")
+        inp = obj.get("input") or {}
+        # Pick a short, useful summary of the input without dumping JSON.
+        summary = " ".join(f"{k}={v}" for k, v in list(inp.items())[:2])
+        return f"⟨tool:{name}⟩ {summary}"[:200]
+    if t == "tool_result":
+        return "⟨result⟩ " + extract_text(obj.get("content") or [])[:300]
+    if t == "thinking":
+        return "⟨thinking⟩ " + (obj.get("thinking") or "")[:300]
+    if t == "create":
+        return f"⟨create⟩ {obj.get('file_path') or obj.get('path', '')}"[:200]
+    if t == "update":
+        return f"⟨update⟩ {obj.get('file_path') or obj.get('path', '')}"[:200]
+    if t == "edited_text_file":
+        return f"⟨edit⟩ {obj.get('file_path') or obj.get('path', '')}"[:200]
+    return ""
+
+
+
 def fmt_ts(ts) -> str:
     if not ts:
         return ""
@@ -463,15 +494,20 @@ def preview_jsonl(
                 if agent == "claude":
                     if obj.get("cwd") and not cwd:
                         cwd = obj["cwd"]
-                    if obj.get("type") in ("user", "assistant"):
+                    t = obj.get("type")
+                    if t in ("user", "assistant"):
                         if obj.get("isMeta"):
                             continue
                         m = obj.get("message") or {}
-                        role = m.get("role") or obj["type"]
+                        role = m.get("role") or t
                         text = extract_text(m.get("content"))
                         if text:
-                            ts = fmt_ts(obj.get("timestamp"))
-                            messages.append((role, text, ts))
+                            messages.append((role, text, fmt_ts(obj.get("timestamp"))))
+                            total += 1
+                    elif t in ("tool_use", "tool_result", "thinking", "create", "update", "edited_text_file"):
+                        text = _claude_event_text(obj)
+                        if text:
+                            messages.append(("tool", text, fmt_ts(obj.get("timestamp"))))
                             total += 1
                 elif agent == "codex":
                     p = obj.get("payload") or {}
@@ -598,10 +634,11 @@ def preview_jsonl(
 
 
 # ---------------------------------------------------------------
-def preview_opencode(sid: str, db_path: str) -> str:
+def preview_opencode(sid: str, db_path: str, query: str = "") -> str:
     db = Path(db_path.replace("sqlite:", ""))
     if not db.is_file():
         return RED(f"db not found: {db}")
+    terms = query_terms(query)
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         tables = {
@@ -611,15 +648,15 @@ def preview_opencode(sid: str, db_path: str) -> str:
             ).fetchall()
         }
         if {"session", "message", "part"}.issubset(tables):
-            return _preview_opencode_current(con, db, sid)
+            return _preview_opencode_current(con, db, sid, terms=terms)
         if {"sessions", "messages"}.issubset(tables):
-            return _preview_opencode_legacy(con, db, sid)
+            return _preview_opencode_legacy(con, db, sid, terms=terms)
         return RED(f"{db}: unknown opencode schema")
     finally:
         con.close()
 
-
-def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str) -> str:
+def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str, terms: list[str] | None = None) -> str:
+    terms = terms or []
     row = con.execute(
         "SELECT id, directory, title, time_updated FROM session WHERE id=?",
         (sid,),
@@ -670,13 +707,14 @@ def _preview_opencode_current(con: sqlite3.Connection, db: Path, sid: str) -> st
         role = d.get("role", "?")
         text = extract_text(parts_by_msg.get(mid) or [])
         if text:
-            lines.append(render_message(role, text, fmt_ts(tc)))
+            lines.append(render_message(role, text, fmt_ts(tc), terms=terms))
             lines.append("")
         prev_i = i
     return "\n".join(lines)
 
 
-def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str) -> str:
+def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str, terms: list[str] | None = None) -> str:
+    terms = terms or []
     cur = con.execute(
         "SELECT id,title,message_count,cost,prompt_tokens,completion_tokens,updated_at "
         "FROM sessions WHERE id=?",
@@ -716,7 +754,7 @@ def _preview_opencode_legacy(con: sqlite3.Connection, db: Path, sid: str) -> str
             p = []
         text = extract_text(p)
         if text:
-            lines.append(render_message(role, text, fmt_ts(created)))
+            lines.append(render_message(role, text, fmt_ts(created), terms=terms))
             lines.append("")
         prev_i = i
     return "\n".join(lines)
@@ -731,7 +769,7 @@ def main() -> int:
     query = sys.argv[4] if len(sys.argv) > 4 else ""
     try:
         if agent == "opencode":
-            out = preview_opencode(sid, source)
+            out = preview_opencode(sid, source, query=query)
         else:
             out = preview_jsonl(Path(source), agent, sid, query=query)
         sys.stdout.write(out)

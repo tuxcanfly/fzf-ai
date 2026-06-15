@@ -39,41 +39,14 @@ def test_stats_with_cache(tmp_path: Path):
     cache_dir = tmp_path / "fzf-ai"
     cache_dir.mkdir(parents=True)
 
-    # Write a minimal index cache
-    cache = {
-        "v": 1,
-        "sources": {
-            "/tmp/session1.jsonl": {
-                "mtime": 1000.0,
-                "size": 100,
-                "source": "/tmp/session1.jsonl",
-                "records": [
-                    {
-                        "agent": "claude",
-                        "session_id": "s1",
-                        "source": "/tmp/s1.jsonl",
-                        "updated": 1776420000.0,
-                        "msgs": 5,
-                        "cwd": "/home/user/proj1",
-                        "title": "refactor auth",
-                        "prompts": ["refactor auth"],
-                    },
-                    {
-                        "agent": "codex",
-                        "session_id": "s2",
-                        "source": "/tmp/s2.jsonl",
-                        "updated": 1776506400.0,
-                        "msgs": 10,
-                        "cwd": "/home/user/proj2",
-                        "title": "fix bug",
-                        "prompts": ["fix bug"],
-                    },
-                ],
-            },
-        },
-    }
-    cache_file = cache_dir / "index.json"
-    cache_file.write_text(json.dumps(cache))
+    # Write a minimal TSV snapshot matching the indexer output format.
+    # Columns: agent session_id source agent-badge updated msgs cwd title [blob]
+    rows = [
+        "claude\ts1\t/tmp/s1.jsonl\tclaude  \t2026-04-17 10:00\t   5\t/home/user/proj1\trefactor auth",
+        "codex\ts2\t/tmp/s2.jsonl\tcodex   \t2026-04-18 10:00\t  10\t/home/user/proj2\tfix bug",
+    ]
+    cache_file = cache_dir / "index.tsv"
+    cache_file.write_text("\n".join(rows) + "\n")
 
     # Test JSON output
     result = subprocess.run(
@@ -137,48 +110,20 @@ def test_stats_days_filter(tmp_path: Path):
 
     # One session from long ago, one recent
     import time as _time
-    now = _time.time()  # actual current timestamp
-    cache = {
-        "v": 1,
-        "sources": {
-            "/tmp/old.jsonl": {
-                "mtime": 1000.0,
-                "size": 100,
-                "source": "/tmp/old.jsonl",
-                "records": [
-                    {
-                        "agent": "claude",
-                        "session_id": "old",
-                        "source": "/tmp/old.jsonl",
-                        "updated": now - 86400 * 30,  # 30 days ago
-                        "msgs": 5,
-                        "cwd": "/p",
-                        "title": "old",
-                        "prompts": ["old"],
-                    },
-                ],
-            },
-            "/tmp/new.jsonl": {
-                "mtime": 1000.0,
-                "size": 100,
-                "source": "/tmp/new.jsonl",
-                "records": [
-                    {
-                        "agent": "codex",
-                        "session_id": "new",
-                        "source": "/tmp/new.jsonl",
-                        "updated": now - 86400 * 2,  # 2 days ago
-                        "msgs": 3,
-                        "cwd": "/p",
-                        "title": "new",
-                        "prompts": ["new"],
-                    },
-                ],
-            },
-        },
-    }
-    cache_file = cache_dir / "index.json"
-    cache_file.write_text(json.dumps(cache))
+    from datetime import datetime, timezone
+    now = _time.time()
+    old_ts = now - 86400 * 30
+    new_ts = now - 86400 * 2
+
+    def _fmt(epoch: float) -> str:
+        return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    rows = [
+        f"claude\told\t/tmp/old.jsonl\tclaude  \t{_fmt(old_ts)}\t   5\t/p\told",
+        f"codex\tnew\t/tmp/new.jsonl\tcodex   \t{_fmt(new_ts)}\t   3\t/p\tnew",
+    ]
+    cache_file = cache_dir / "index.tsv"
+    cache_file.write_text("\n".join(rows) + "\n")
 
     result = subprocess.run(
         [str(SCRIPT), "--json", "--days", "7"],

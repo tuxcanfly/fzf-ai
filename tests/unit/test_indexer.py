@@ -82,6 +82,8 @@ class TestRecord:
         assert r.title == ""
         assert r.prompts == []
         assert r._prompt_set == set()
+        assert r.user_prompts == []
+        assert r._user_prompt_set == set()
 
     def test_add_search_text_deduplicates(self):
         r = idx.Record("claude", "s1", "/tmp/x.jsonl")
@@ -91,6 +93,7 @@ class TestRecord:
         assert len(r.prompts) == 2
         assert "hello world" in r.prompts
         assert "goodbye" in r.prompts
+        assert r.user_prompts == []
 
     def test_add_search_text_truncates_at_max_chunk(self):
         r = idx.Record("claude", "s1", "/tmp/x.jsonl")
@@ -113,14 +116,15 @@ class TestRecord:
         r.add_prompt("Caveat: something")
         assert len(r.prompts) == 1
         assert "real prompt" in r.prompts
+        assert r.user_prompts == ["real prompt"]
 
     def test_add_prompt_collects_many(self):
         r = idx.Record("claude", "s1", "/tmp/x.jsonl")
         for i in range(idx.MAX_PROMPTS + 10):
             r.add_prompt(f"prompt {i}")
-        # add_prompt delegates to add_search_text which has no cap;
-        # MAX_PROMPTS is enforced by the reader's skip_search flag.
+        # add_prompt has no cap; MAX_PROMPTS is enforced by the reader's skip_search flag.
         assert len(r.prompts) == idx.MAX_PROMPTS + 10
+        assert len(r.user_prompts) == idx.MAX_PROMPTS + 10
 
     def test_as_row_contains_all_fields(self):
         r = idx.Record("claude", "sid-123", "/tmp/x.jsonl")
@@ -128,7 +132,8 @@ class TestRecord:
         r.msgs = 5
         r.cwd = "/home/user/proj"
         r.title = "refactor auth"
-        r.prompts = ["refactor auth", "add tests"]
+        r.add_prompt("refactor auth")
+        r.add_prompt("add tests")
         row = r.as_row()
         fields = row.split("\t")
         assert len(fields) == 9
@@ -148,11 +153,45 @@ class TestRecord:
     def test_as_row_search_blob_max_length(self):
         r = idx.Record("claude", "s1", "/tmp/x.jsonl")
         for i in range(50):
-            r.add_search_text(f"prompt text number {i} " * 10)
+            r.add_prompt(f"prompt text number {i} " * 10)
         row = r.as_row()
         fields = row.split("\t")
         assert len(fields[8]) <= idx.MAX_SEARCH_BLOB
 
+    def test_as_row_exact_blob_uses_unit_separator(self):
+        r = idx.Record("claude", "s1", "/tmp/x.jsonl")
+        r.add_prompt("hello world")
+        r.add_prompt("foo bar")
+        fields = r.as_row().split("\t")
+        assert "\x1f" in fields[8]
+        assert "hello world\x1ffoo bar" == fields[8]
+
+    def test_fuzzy_blob_extracts_distinctive_tokens(self):
+        r = idx.Record("claude", "s1", "/tmp/x.jsonl")
+        r.add_prompt("How do I refactor the auth middleware?")
+        r.add_prompt("The quick brown fox jumps over the lazy dog")
+        tokens = r.fuzzy_blob().split()
+        assert "refactor" in tokens
+        assert "auth" in tokens
+        assert "middleware" in tokens
+        assert "the" not in tokens
+        assert "over" not in tokens
+
+    def test_fuzzy_blob_respects_max_tokens(self):
+        r = idx.Record("claude", "s1", "/tmp/x.jsonl")
+        for i in range(idx.MAX_FUZZY_TOKENS + 20):
+            r.add_prompt(f"word{i} another")
+        blob = r.fuzzy_blob()
+        assert len(blob.split()) <= idx.MAX_FUZZY_TOKENS
+
+    def test_as_row_fuzzy_mode_returns_token_blob(self):
+        r = idx.Record("claude", "s1", "/tmp/x.jsonl")
+        r.add_prompt("Refactor the auth middleware")
+        fields = r.as_row(mode="fuzzy").split("\t")
+        assert "refactor" in fields[8]
+        assert "auth" in fields[8]
+        assert "middleware" in fields[8]
+        assert "\x1f" not in fields[8]
 
 # ============================================================================
 # clean() tests
@@ -312,51 +351,114 @@ class TestIterTextFragments:
 # ============================================================================
 
 class TestIndexCache:
-    def test_cache_load_missing(self, tmp_path):
+    def test_open_cache_db_creates_schema(self, tmp_path):
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
-        monkeypatch.setattr(idx, "_get_index_cache_path",
-                            lambda: tmp_path / "index.json")
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
         try:
-            cache = idx._load_index_cache()
-            assert cache["v"] == idx.INDEX_CACHE_VERSION
-            assert cache["sources"] == {}
+            con = idx._open_cache_db()
+            try:
+                cur = con.execute("SELECT value FROM cache_meta WHERE key='v'")
+                assert cur.fetchone()[0] == str(idx.CACHE_DB_VERSION)
+                cur = con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='sources'"
+                )
+                assert cur.fetchone() is not None
+            finally:
+                con.close()
         finally:
             monkeypatch.undo()
 
-    def test_cache_save_and_load(self, tmp_path):
-        cache = {"v": idx.INDEX_CACHE_VERSION, "sources": {"test": {"key": "val"}}}
-        # Override cache path
+    def test_upsert_and_load_cached_records(self, tmp_path):
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
-        monkeypatch.setattr(idx, "_get_index_cache_path",
-                            lambda: tmp_path / "index.json")
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
         try:
-            idx._save_index_cache(cache)
-            loaded = idx._load_index_cache()
-            assert loaded["sources"]["test"]["key"] == "val"
+            con = idx._open_cache_db()
+            try:
+                rec = idx.Record("claude", "s1", "/tmp/x.jsonl")
+                rec.updated = 1744876800.0
+                rec.msgs = 3
+                rec.cwd = "/home/user/proj"
+                rec.title = "test session"
+                rec.prompts = ["hello", "world"]
+                path = tmp_path / "x.jsonl"
+                path.write_text("{}")
+                idx._upsert_source_records(con, "claude", str(path), path, [rec])
+                con.commit()
+                loaded = idx._load_cached_records(con, str(path))
+                assert len(loaded) == 1
+                assert loaded[0].session_id == "s1"
+                assert loaded[0].title == "test session"
+                assert loaded[0].prompts == ["hello", "world"]
+            finally:
+                con.close()
         finally:
             monkeypatch.undo()
 
-    def test_cache_invalid_version_returns_default(self, tmp_path):
+    def test_source_is_fresh_checks_mtime_and_size(self, tmp_path):
         monkeypatch = pytest.MonkeyPatch()
         monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
-        monkeypatch.setattr(idx, "_get_index_cache_path",
-                            lambda: tmp_path / "index.json")
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
         try:
-            (tmp_path / "index.json").write_text('{"v": 999, "sources": {}}')
-            loaded = idx._load_index_cache()
-            assert loaded["v"] == idx.INDEX_CACHE_VERSION
+            con = idx._open_cache_db()
+            try:
+                path = tmp_path / "fresh.jsonl"
+                path.write_text("hello")
+                rec = idx.Record("claude", "s1", str(path))
+                idx._upsert_source_records(con, "claude", str(path), path, [rec])
+                con.commit()
+                assert idx._source_is_fresh(con, str(path)) is True
+                path.write_text("changed")
+                assert idx._source_is_fresh(con, str(path)) is False
+                assert idx._source_is_fresh(con, "/nonexistent/file.jsonl") is False
+            finally:
+                con.close()
         finally:
             monkeypatch.undo()
 
-    def test_validate_cache_entry_missing_file(self):
-        entry = {"source": "/nonexistent/file.jsonl", "mtime": 0, "size": 0}
-        assert idx._validate_cache_entry(entry) is False
+    def test_source_is_fresh_for_sqlite_source(self, tmp_path):
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
+        try:
+            con = idx._open_cache_db()
+            try:
+                db_path = tmp_path / "opencode.db"
+                db_path.write_text("")
+                rec = idx.Record("opencode", "s1", f"sqlite:{db_path}")
+                idx._upsert_source_records(con, "opencode", f"sqlite:{db_path}", db_path, [rec])
+                con.commit()
+                assert idx._source_is_fresh(con, f"sqlite:{db_path}") is True
+                db_path.unlink()
+                assert idx._source_is_fresh(con, f"sqlite:{db_path}") is False
+            finally:
+                con.close()
+        finally:
+            monkeypatch.undo()
 
-    def test_validate_cache_entry_sqlite_missing(self):
-        entry = {"source": "sqlite:/nonexistent/db", "mtime": 0}
-        assert idx._validate_cache_entry(entry) is False
+    def test_delete_stale_agent_sources(self, tmp_path):
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
+        try:
+            con = idx._open_cache_db()
+            try:
+                p1 = tmp_path / "a.jsonl"
+                p2 = tmp_path / "b.jsonl"
+                p1.write_text("a")
+                p2.write_text("b")
+                idx._upsert_source_records(con, "claude", str(p1), p1, [idx.Record("claude", "a", str(p1))])
+                idx._upsert_source_records(con, "claude", str(p2), p2, [idx.Record("claude", "b", str(p2))])
+                con.commit()
+                idx._delete_stale_agent_sources(con, "claude", {str(p1)})
+                con.commit()
+                cur = con.execute("SELECT source FROM sources WHERE agent='claude'")
+                assert {row[0] for row in cur.fetchall()} == {str(p1)}
+            finally:
+                con.close()
+        finally:
+            monkeypatch.undo()
 
 
 # ============================================================================
@@ -683,3 +785,79 @@ class TestSorting:
         records = list(idx.walk_claude())
         records.sort(key=lambda r: r.updated, reverse=True)
         assert records[0].updated >= records[1].updated
+
+
+# ============================================================================
+# Incremental cache behaviour
+# ============================================================================
+
+class TestIncrementalCache:
+    def _cache_con(self, monkeypatch, tmp_path: Path):
+        """Helper: open a cache DB in a temp location and patch the indexer."""
+        monkeypatch.setattr(idx, "CACHE_DIR", tmp_path)
+        monkeypatch.setattr(idx, "_get_index_cache_path", lambda: tmp_path / "index.db")
+        return idx._open_cache_db()
+
+    def test_unchanged_file_loaded_from_cache(self, claude_dir: Path, monkeypatch, tmp_path: Path):
+        path = claude_dir / "p" / "s1.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(_j(claude_prompt("first")) + "\n")
+
+        con = self._cache_con(monkeypatch, tmp_path)
+        try:
+            # First walk populates the cache.
+            first = list(idx.walk_claude(con))
+            assert len(first) == 1
+            assert first[0].title == "first"
+
+            # Mutate the file without changing mtime/size (impossible in real life,
+            # but we simulate by directly rewriting the cached title).
+            loaded = idx._load_cached_records(con, str(path))
+            loaded[0].title = "cached-title"
+            idx._upsert_source_records(con, "claude", str(path), path, loaded)
+            con.commit()
+
+            # Second walk should return the cached mutated record, not re-parse.
+            second = list(idx.walk_claude(con))
+            assert len(second) == 1
+            assert second[0].title == "cached-title"
+        finally:
+            con.close()
+
+    def test_modified_file_reparsed(self, claude_dir: Path, monkeypatch, tmp_path: Path):
+        path = claude_dir / "p" / "s1.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(_j(claude_prompt("first")) + "\n")
+
+        con = self._cache_con(monkeypatch, tmp_path)
+        try:
+            first = list(idx.walk_claude(con))
+            assert first[0].title == "first"
+
+            # Modify the file on disk (changes mtime and size).
+            path.write_text(_j(claude_prompt("second")) + "\n")
+
+            second = list(idx.walk_claude(con))
+            assert len(second) == 1
+            assert second[0].title == "second"
+        finally:
+            con.close()
+
+    def test_deleted_file_removed_from_cache(self, claude_dir: Path, monkeypatch, tmp_path: Path):
+        path = claude_dir / "p" / "s1.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(_j(claude_prompt("hello")) + "\n")
+
+        con = self._cache_con(monkeypatch, tmp_path)
+        try:
+            first = list(idx.walk_claude(con))
+            assert len(first) == 1
+
+            path.unlink()
+            second = list(idx.walk_claude(con))
+            assert len(second) == 0
+
+            cur = con.execute("SELECT source FROM sources WHERE agent='claude'")
+            assert cur.fetchall() == []
+        finally:
+            con.close()

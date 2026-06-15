@@ -55,15 +55,45 @@ _AGENT_COLOR = {
 
 
 def _load_cache() -> dict:
-    """Load the index cache (fastest path, no indexing)."""
-    path = CACHE_DIR / "index.json"
+    """Load records from the hot TSV snapshot.
+
+    Returns a dict compatible with the old index.json layout so the rest
+    of the dashboard code can stay unchanged.
+    """
+    path = CACHE_DIR / "index.tsv"
     if not path.is_file():
         return {}
+    records: list[dict] = []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 8:
+                    continue
+                try:
+                    updated_dt = datetime.strptime(parts[4].strip(), "%Y-%m-%d %H:%M")
+                    updated = updated_dt.replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    updated = 0.0
+                try:
+                    msgs = int(parts[5].strip())
+                except ValueError:
+                    msgs = 0
+                records.append({
+                    "agent": parts[0],
+                    "session_id": parts[1],
+                    "source": parts[2],
+                    "updated": updated,
+                    "msgs": msgs,
+                    "cwd": parts[6].strip(),
+                    "title": parts[7] if len(parts) > 7 else "",
+                })
     except Exception:
         return {}
-
+    return {"sources": {"snapshot": {"records": records}}}
 
 def _load_tags() -> dict:
     path = FZFAI_DIR / "tags.json"

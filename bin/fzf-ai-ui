@@ -61,7 +61,7 @@ footer() {
 
   awk -F'\t' '
     BEGIN {
-      split("claude codex opencode droid pi", order, " ")
+      split("claude codex opencode droid pi omp", order, " ")
     }
     {
       sessions++

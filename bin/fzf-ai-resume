@@ -82,6 +82,14 @@ case "$agent" in
       run_cmd pi --resume "$sid"
     fi
     ;;
+  omp)
+    # omp (Oh My Pi) supports the same resume/session flags as pi.
+    if [[ -n "$source" && -f "$source" ]]; then
+      run_cmd omp --session "$source"
+    else
+      run_cmd omp --resume "$sid"
+    fi
+    ;;
   *)
     echo "fzf-ai-resume: unknown agent '$agent'" >&2
     exit 2

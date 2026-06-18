@@ -94,6 +94,7 @@ _AGENT_COLOR = {
     "opencode": "38;5;141",  # purple
     "droid":    "38;5;76",   # green
     "pi":       "38;5;220",  # yellow
+    "omp":      "38;5;51",   # bright cyan
 }
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
@@ -1044,12 +1045,105 @@ def _read_pi_file(path: Path) -> Optional[Record]:
 
 
 # --------------------------------------------------------------------------
+# omp (Oh My Pi) -- ~/.omp/agent/sessions/<enc-cwd>/<iso>_<uuid>.jsonl
+# --------------------------------------------------------------------------
+def walk_omp(cache_con: sqlite3.Connection | None = None) -> Iterator[Record]:
+    root = HOME / ".omp" / "agent" / "sessions"
+    con = cache_con or _open_cache_db()
+    own_con = cache_con is None
+    try:
+        current_sources: set[str] = set()
+        uncached_paths: list[Path] = []
+        for path in _collect_jsonl_paths(root):
+            source = str(path)
+            current_sources.add(source)
+            if _source_is_fresh(con, source):
+                yield from _load_cached_records(con, source)
+            else:
+                uncached_paths.append(path)
+        for rec in _parallel_read(uncached_paths, _read_omp_file, "omp"):
+            _upsert_source_records(con, "omp", rec.source, Path(rec.source), [rec])
+            yield rec
+        _delete_stale_agent_sources(con, "omp", current_sources)
+        con.commit()
+    finally:
+        if own_con:
+            con.close()
+
+
+def _read_omp_file(path: Path) -> Optional[Record]:
+    m = re.match(
+        r".*_([0-9a-f-]+)$",
+        path.stem,
+    )
+    sid = m.group(1) if m else path.stem
+    rec = Record(
+        agent="omp",
+        session_id=sid,
+        source=str(path),
+        updated=path.stat().st_mtime,
+    )
+    title = ""
+    cwd = ""
+    msgs = 0
+    skip_search = False
+    with path.open("r", encoding="utf-8", errors="replace", buffering=1 << 16) as f:
+        for line in f:
+            is_message = '"type":"message"' in line
+            is_session = not is_message and '"type":"session"' in line
+            if not (is_message or is_session):
+                continue
+            try:
+                obj = _JSON_LOADS(line)
+            except stdjson.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "session":
+                c = obj.get("cwd")
+                if c:
+                    cwd = c
+                tt = obj.get("title")
+                if tt and not title:
+                    title = tt
+                oid = obj.get("id")
+                if oid:
+                    rec.session_id = oid
+                continue
+            if t != "message":
+                continue
+            m = obj.get("message") or {}
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            msgs += 1
+            if not skip_search:
+                is_user = role == "user"
+                for tx in iter_text_fragments(m.get("content") or ()):
+                    if is_user and is_real_prompt(tx):
+                        if not title:
+                            title = tx
+                        rec.add_prompt(tx)
+                    else:
+                        rec.add_search_text(tx)
+                if len(rec.prompts) >= MAX_PROMPTS:
+                    skip_search = True
+            ts = obj.get("timestamp")
+            if ts:
+                e = iso_to_epoch(ts)
+                if e > rec.updated:
+                    rec.updated = e
+    rec.title = title
+    rec.cwd = cwd
+    rec.msgs = msgs
+    return rec
+# --------------------------------------------------------------------------
 WALKERS = {
     "claude": walk_claude,
     "codex": walk_codex,
     "opencode": walk_opencode,
     "droid": walk_droid,
     "pi": walk_pi,
+    "omp": walk_omp,
 }
 
 

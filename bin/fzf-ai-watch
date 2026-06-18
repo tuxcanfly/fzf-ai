@@ -42,12 +42,21 @@ else:
 WATCH_INTERVAL = max(1, int(os.environ.get("FZFAI_WATCH_INTERVAL", "60")))
 
 
-def _run_update(agents: list[str]) -> None:
-    """Refresh the cache for the given agents and write a hot TSV snapshot."""
+def _run_update(priority_agents: list[str]) -> None:
+    """Refresh the cache and write a hot TSV snapshot.
+
+    Always indexes every known agent so the snapshot is complete, but
+    refreshes the agents requested on the command line first. This avoids
+    the surprising behaviour where `fzf-ai-watch claude` leaves a
+    claude-only snapshot that makes other agents appear missing.
+    """
     con = _idx_module._open_cache_db()
     records: list = []
     try:
-        for agent in agents:
+        all_agents = list(_idx_module.WALKERS.keys())
+        seen = set(priority_agents)
+        ordered = list(priority_agents) + [a for a in all_agents if a not in seen]
+        for agent in ordered:
             walker = _idx_module._resolve_walker(agent)
             if not walker:
                 print(f"fzf-ai-watch: unknown agent: {agent}", file=sys.stderr)
@@ -66,7 +75,6 @@ def _run_update(agents: list[str]) -> None:
     finally:
         con.close()
 
-
 def main() -> int:
     agents = sys.argv[1:] or list(_idx_module.WALKERS.keys())
 
@@ -79,7 +87,8 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    # First pass runs immediately.
+    # First pass runs immediately. Pass command-line agents as the priority
+    # set; _run_update will still refresh every agent for a complete snapshot.
     _run_update(agents)
 
     while not stop:

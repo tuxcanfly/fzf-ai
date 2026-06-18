@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fzf-ai: fuzzy browser for AI coding sessions across claude, codex,
-# opencode, droid, and pi. Selecting an item resumes it in its native CLI.
+# opencode, droid, pi, and omp. Selecting an item resumes it in its native CLI.
 #
 # Keybinds (shown in fzf header):
 #   enter          resume the session in its tool
@@ -17,7 +17,7 @@
 #   shift-up/down  scroll preview half a page
 #   ctrl-shift-up/down  scroll preview a full page
 #   alt-</alt->    jump to first / last session
-#   alt-1..5       filter to one agent only
+#   alt-1..6       filter to one agent only
 #   alt-0          clear filter
 set -uo pipefail
 
@@ -117,8 +117,9 @@ RELOAD_CODEX_CMD=$(quote_cmd "$FZFAI_INDEX" codex)
 RELOAD_OPENCODE_CMD=$(quote_cmd "$FZFAI_INDEX" opencode)
 RELOAD_DROID_CMD=$(quote_cmd "$FZFAI_INDEX" droid)
 RELOAD_PI_CMD=$(quote_cmd "$FZFAI_INDEX" pi)
+RELOAD_OMP_CMD=$(quote_cmd "$FZFAI_INDEX" omp)
 
-HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  alt-s: star  ·  ctrl-d: delete  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-w: wrap  ·  alt-1..5: agent'
+HEADER=$'scope: [all] [agent] [cwd] [title] [content]  ·  click header or ctrl-s to change\nenter: resume  ·  ctrl-o: shell  ·  ctrl-e: edit  ·  alt-s: star  ·  ctrl-d: delete  ·  ctrl-r: reload  ·  ?: preview  ·  alt-p: layout  ·  alt-w: wrap  ·  alt-1..6: agent'
 if [[ -n "$COPY" ]]; then
   HEADER+=$'  ·  ctrl-y: copy id  ·  ctrl-k: copy cmd'
 fi
@@ -203,7 +204,6 @@ FZF_ARGS=(
   # start: binding is added below depending on snapshot freshness.
   --accept-nth=1,2,3,7
   --expect=enter
-  --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload-sync($RELOAD_CMD)"
   --bind="load:bg-cancel+transform-prompt[$UI prompt]+bg-transform-list-label[$UI list-label]+bg-transform-footer[$UI footer {*f}]"
   --bind="result:bg-cancel+transform-prompt[$UI prompt]+bg-transform-list-label[$UI list-label]+bg-transform-footer[$UI footer {*f}]"
   --bind="focus:bg-transform-preview-label[$UI preview-label {1} {2} {8}]"
@@ -240,6 +240,7 @@ FZF_ARGS=(
   --bind="alt-3:change-border-label( fzf-ai · opencode )+reload($RELOAD_OPENCODE_CMD)"
   --bind="alt-4:change-border-label( fzf-ai · droid )+reload($RELOAD_DROID_CMD)"
   --bind="alt-5:change-border-label( fzf-ai · pi )+reload($RELOAD_PI_CMD)"
+  --bind="alt-6:change-border-label( fzf-ai · omp )+reload($RELOAD_OMP_CMD)"
   --bind="alt-0:change-border-label($BORDER_LABEL)+reload($RELOAD_CMD)"
   --bind='double-click:accept'
   --bind='ctrl-w:backward-kill-word'
@@ -292,23 +293,42 @@ filter_snapshot() {
   ' "$snap"
 }
 
-SNAPSHOT_MAX_AGE=${FZFAI_SNAPSHOT_MAX_AGE:-120}
+SNAPSHOT_MAX_AGE=${FZFAI_SNAPSHOT_MAX_AGE:-3600}
+snapshot_exists=0
 snapshot_fresh=0
 if [[ -f "$SNAPSHOT" && -z "${FZFAI_FORCE_INDEX:-}" ]]; then
+  snapshot_exists=1
   age=$(snapshot_age_seconds "$SNAPSHOT")
   if [[ $age -le $SNAPSHOT_MAX_AGE ]]; then
     snapshot_fresh=1
   fi
 fi
 
-if [[ $snapshot_fresh -eq 1 ]]; then
+if [[ $snapshot_exists -eq 1 ]]; then
+  # Always show the snapshot immediately so the UI never appears empty.
+  # If it's stale, kick off a background reload right after fzf starts.
+  if [[ $snapshot_fresh -eq 1 ]]; then
+    footer="Snapshot loaded · ctrl-r to refresh"
+  else
+    footer="Snapshot loaded (stale) · refreshing in background…"
+  fi
   FZF_ARGS+=(
-    --bind="start:change-list-label( Loading sessions )+change-footer( Snapshot loaded · ctrl-r to refresh )"
+    --bind="start:change-list-label( Loading sessions )+change-footer( $footer )"
   )
+  if [[ $snapshot_fresh -eq 0 ]]; then
+    # Non-blocking refresh: load cached data now, swap in fresh index when ready.
+    # `load` fires once fzf has finished reading the initial input stream.
+    FZF_ARGS+=(
+      --bind="load:reload($RELOAD_CMD)"
+    )
+  fi
   selection=$(filter_snapshot "$SNAPSHOT" "${AGENTS[@]}" | fzf "${FZF_ARGS[@]}")
 else
+  # No snapshot: open fzf immediately with an empty list and populate it in
+  # the background. reload() is non-blocking; the list fills once indexing
+  # finishes, so the user can start typing a query right away.
   FZF_ARGS+=(
-    --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload-sync($RELOAD_CMD)"
+    --bind="start:change-list-label( Loading sessions )+change-footer( Indexing session stores… )+reload($RELOAD_CMD)"
   )
   selection=$(fzf "${FZF_ARGS[@]}")
 fi
